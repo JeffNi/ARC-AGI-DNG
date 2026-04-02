@@ -1,0 +1,6 @@
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.8
+jupyter==1.1.1
+arckit==1.0.1
+pandas==2.3.3

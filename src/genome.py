@@ -1,0 +1,106 @@
+"""
+Genome: the parameters that define a network's architecture.
+
+See docs/02_Architecture.md and docs/04_ARC_Strategy.md.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass
+class Genome:
+    """All parameters needed to instantiate a DNG from a template."""
+
+    # ── Grid dimensions (max supported size) ─────────────────────────
+    max_h: int = 30
+    max_w: int = 30
+
+    # ── Internal processing region ────────────────────────────────────
+    n_internal: int = 500
+    frac_inhibitory: float = 0.2
+    frac_modulatory: float = 0.05
+    frac_memory: float = 0.1
+
+    # ── Long-term memory pool ─────────────────────────────────────────
+    n_memory: int = 100
+
+    # ── Shared concept pool ───────────────────────────────────────────
+    n_concept: int = 100
+    density_column_to_concept: float = 0.3
+    density_concept_to_column: float = 0.3
+
+    # ── Connection densities ──────────────────────────────────────────
+    density_sensory_to_internal: float = 0.3
+    density_internal_to_motor: float = 0.3
+    density_internal_to_internal: float = 0.4
+    density_motor_to_internal: float = 0.1
+    density_sensory_to_motor: float = 0.05
+    density_internal_to_sensory: float = 0.05
+    density_sensory_neighbors: float = 0.1
+    density_motor_neighbors: float = 0.1
+
+    # ── Fan-in cap ────────────────────────────────────────────────────
+    max_fan_in: int = 150
+
+    # ── Weight initialization ─────────────────────────────────────────
+    weight_scale: float = 0.01
+
+    # ── Facilitation parameters ───────────────────────────────────────
+    f_rate: float = 0.05
+    f_decay: float = 0.02
+    f_max: float = 3.0
+
+    # ── Growth / lifecycle parameters ─────────────────────────────────
+    eta_w: float = 0.05
+    lambda_w: float = 0.001
+    w_max: float = 5.0
+    plasticity_rounds: int = 3
+    k_reward: float = 2.0
+    sleep_factor: float = 0.95
+    prune_epsilon: float = 0.005
+    think_steps: int = 50
+    learn_steps: int = 30
+    rest_steps: int = 30
+    rest_noise_std: float = 0.05
+
+    def mutate(self, rng: np.random.Generator, strength: float = 0.1) -> "Genome":
+        """Create a mutated copy of this genome."""
+        g = Genome(**{k: v for k, v in self.__dict__.items()})
+
+        def _perturb_int(val, lo, hi):
+            delta = max(1, int(abs(val) * strength))
+            return int(np.clip(val + rng.integers(-delta, delta + 1), lo, hi))
+
+        def _perturb_float(val, lo, hi):
+            return float(np.clip(val + rng.normal(0, abs(val) * strength + 0.001), lo, hi))
+
+        g.n_internal = _perturb_int(g.n_internal, 50, 5000)
+        g.n_concept = _perturb_int(g.n_concept, 10, 500)
+        g.n_memory = _perturb_int(g.n_memory, 10, 500)
+        g.max_fan_in = _perturb_int(g.max_fan_in, 20, 500)
+        g.frac_inhibitory = _perturb_float(g.frac_inhibitory, 0.0, 0.5)
+        g.frac_modulatory = _perturb_float(g.frac_modulatory, 0.0, 0.3)
+        g.frac_memory = _perturb_float(g.frac_memory, 0.0, 0.5)
+
+        for attr in ['density_sensory_to_internal', 'density_internal_to_motor',
+                      'density_internal_to_internal', 'density_motor_to_internal',
+                      'density_sensory_to_motor', 'density_internal_to_sensory',
+                      'density_sensory_neighbors', 'density_motor_neighbors']:
+            setattr(g, attr, _perturb_float(getattr(g, attr), 0.0, 1.0))
+
+        g.weight_scale = _perturb_float(g.weight_scale, 0.0001, 1.0)
+        g.f_rate = _perturb_float(g.f_rate, 0.001, 0.5)
+        g.f_decay = _perturb_float(g.f_decay, 0.001, 0.2)
+        g.f_max = _perturb_float(g.f_max, 0.5, 10.0)
+        g.eta_w = _perturb_float(g.eta_w, 0.001, 1.0)
+        g.w_max = _perturb_float(g.w_max, 1.0, 20.0)
+        g.sleep_factor = _perturb_float(g.sleep_factor, 0.5, 0.999)
+        g.prune_epsilon = _perturb_float(g.prune_epsilon, 0.0001, 0.1)
+        g.think_steps = _perturb_int(g.think_steps, 5, 200)
+        g.rest_steps = _perturb_int(g.rest_steps, 5, 200)
+        g.rest_noise_std = _perturb_float(g.rest_noise_std, 0.001, 0.5)
+
+        return g

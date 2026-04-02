@@ -1,0 +1,36 @@
+{
+  "name": "identity_copy",
+  "description": "Copy the input grid to the output unchanged",
+  "input": [
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      4
+    ]
+  ],
+  "output": [
+    [
+      1,
+      2
+    ],
+    [
+      3,
+      4
+    ]
+  ],
+  "steps": [
+    [
+      [
+        1,
+        2
+      ],
+      [
+        3,
+        4
+      ]
+    ]
+  ]
+}

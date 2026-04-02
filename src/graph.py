@@ -1,0 +1,360 @@
+"""
+Core data structure for the Dynamic Neural Graph.
+
+Memory systems:
+  Immediate:  V, r (activity)        -- decays in ~5-10 steps
+  Short-term: f (facilitation/node)  -- decays in ~100-200 steps, resets between tasks
+  Long-term:  memory nodes           -- near-zero decay, self-sustaining, persists across tasks
+  Permanent:  weights                -- changed only during childhood
+
+Neuromodulators (global scalars, broadcast to all synapses):
+  DA  (dopamine):       reward prediction error → learning magnitude
+  ACh (acetylcholine):  learning mode (high=plastic childhood, low=stable adult)
+  NE  (norepinephrine): surprise/arousal → sharpens focus, reduces noise
+
+See docs/03_Mathematics.md for full definitions.
+"""
+
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Union
+
+import numpy as np
+from scipy import sparse
+
+
+class NodeType(enum.Enum):
+    E = "excitatory"
+    I = "inhibitory"
+    M = "modulatory"
+    Mem = "memory"
+
+
+class Region(enum.Enum):
+    SENSORY = "sensory"
+    LOCAL_DETECT = "local_detect"
+    MID_LEVEL = "mid_level"
+    ABSTRACT = "abstract"
+    MOTOR = "motor"
+    MEMORY = "memory"
+
+
+_NTYPE_LIST = list(NodeType)
+_NTYPE_E = _NTYPE_LIST.index(NodeType.E)
+_NTYPE_I = _NTYPE_LIST.index(NodeType.I)
+_NTYPE_M = _NTYPE_LIST.index(NodeType.M)
+_NTYPE_MEM = _NTYPE_LIST.index(NodeType.Mem)
+
+DEFAULT_LEAK = {
+    NodeType.E: 0.3,
+    NodeType.I: 0.5,
+    NodeType.M: 0.2,
+    NodeType.Mem: 0.02,
+}
+
+
+@dataclass
+class DNG:
+    """
+    Dynamic Neural Graph.
+
+    State per node:
+      V[i]          -- membrane potential (real-valued)
+      r[i]          -- firing rate = clip(V - threshold, 0, max_rate)
+      adaptation[i] -- fatigue current
+      f[i]          -- short-term facilitation (presynaptic, per-node)
+    """
+
+    n_nodes: int
+    node_types: np.ndarray
+    regions: np.ndarray
+
+    # Per-node state
+    V: np.ndarray = None
+    threshold: np.ndarray = None
+    max_rate: float = 1.0
+
+    # Per-node parameters
+    excitability: np.ndarray = None
+    leak_rates: np.ndarray = None
+    adapt_rate: float = 0.01
+    adapt_decay: float = 0.1
+
+    # Derived (computed from V each step)
+    r: np.ndarray = None
+    prev_r: np.ndarray = None
+    adaptation: np.ndarray = None
+
+    # Short-term facilitation (presynaptic, per-node)
+    f: np.ndarray = None
+    f_rate: float = 0.05
+    f_decay: float = 0.02
+    f_max: float = 3.0
+
+    # Neuromodulators (global scalars)
+    da: float = 0.0           # dopamine: reward prediction error
+    da_baseline: float = 0.3  # running average of recent rewards
+    ach: float = 1.0          # acetylcholine: learning mode (1=childhood, 0=adult)
+    ne: float = 0.0           # norepinephrine: surprise/arousal
+
+    # Node groups
+    input_nodes: np.ndarray = None
+    output_nodes: np.ndarray = None
+    memory_nodes: np.ndarray = None
+
+    # Edge storage
+    _edge_src: np.ndarray = field(default=None, repr=False)
+    _edge_dst: np.ndarray = field(default=None, repr=False)
+    _edge_w: np.ndarray = field(default=None, repr=False)
+    _edge_tag: np.ndarray = field(default=None, repr=False)
+    _edge_weak_count: np.ndarray = field(default=None, repr=False)
+    _edge_count: int = field(default=0, repr=False)
+    _edge_capacity: int = field(default=0, repr=False)
+
+    # Cached CSR
+    _W_csr: sparse.csr_matrix = field(default=None, repr=False)
+    _csr_dirty: bool = field(default=True, repr=False)
+
+    # Grid dimensions
+    max_h: int = field(default=0, repr=False)
+    max_w: int = field(default=0, repr=False)
+
+    # Column info
+    column_ids: np.ndarray = field(default=None, repr=False)
+    n_columns: int = field(default=0, repr=False)
+    wta_k_frac: float = field(default=0.2, repr=False)
+
+    # Type masks
+    _mask_I: np.ndarray = field(default=None, repr=False)
+    _mask_E: np.ndarray = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.V is None:
+            self.V = np.zeros(self.n_nodes)
+        if self.threshold is None:
+            self.threshold = np.full(self.n_nodes, 0.1)
+        if self.excitability is None:
+            self.excitability = np.ones(self.n_nodes)
+        if self.leak_rates is None:
+            self.leak_rates = np.full(self.n_nodes, 0.3)
+        if self.r is None:
+            self.r = np.zeros(self.n_nodes)
+        if self.prev_r is None:
+            self.prev_r = np.zeros(self.n_nodes)
+        if self.adaptation is None:
+            self.adaptation = np.zeros(self.n_nodes)
+        if self.f is None:
+            self.f = np.zeros(self.n_nodes)
+        if self.column_ids is None:
+            self.column_ids = np.full(self.n_nodes, -1, dtype=np.int32)
+        if self.memory_nodes is None:
+            self.memory_nodes = np.array([], dtype=np.int32)
+
+        if self._edge_src is None:
+            cap = max(1000, self.n_nodes * 10)
+            self._edge_src = np.empty(cap, dtype=np.int32)
+            self._edge_dst = np.empty(cap, dtype=np.int32)
+            self._edge_w = np.empty(cap, dtype=np.float64)
+            self._edge_tag = np.zeros(cap, dtype=np.float64)
+            self._edge_weak_count = np.zeros(cap, dtype=np.int32)
+            self._edge_consolidation = np.zeros(cap, dtype=np.float64)
+            self._edge_count = 0
+            self._edge_capacity = cap
+
+        self._build_type_masks()
+
+    def _build_type_masks(self):
+        self._mask_I = self.node_types == _NTYPE_I
+        self._mask_E = ~self._mask_I
+
+    def compute_rates(self):
+        self.r = np.clip(self.V - self.threshold, 0.0, self.max_rate)
+
+    def reset_facilitation(self):
+        """Reset short-term facilitation (between tasks)."""
+        self.f[:] = 0.0
+
+    def reset_activity(self):
+        """Reset all transient state (between tasks)."""
+        self.V[:] = 0.0
+        self.r[:] = 0.0
+        self.prev_r[:] = 0.0
+        self.adaptation[:] = 0.0
+        self.f[:] = 0.0
+
+    def _ensure_capacity(self, needed: int):
+        if needed > self._edge_capacity:
+            new_cap = max(needed, self._edge_capacity * 2)
+            self._edge_src = np.resize(self._edge_src, new_cap)
+            self._edge_dst = np.resize(self._edge_dst, new_cap)
+            self._edge_w = np.resize(self._edge_w, new_cap)
+            old_tag = self._edge_tag
+            self._edge_tag = np.zeros(new_cap, dtype=np.float64)
+            self._edge_tag[:len(old_tag)] = old_tag
+            old_wc = self._edge_weak_count
+            self._edge_weak_count = np.zeros(new_cap, dtype=np.int32)
+            self._edge_weak_count[:len(old_wc)] = old_wc
+            old_cons = self._edge_consolidation
+            self._edge_consolidation = np.zeros(new_cap, dtype=np.float64)
+            self._edge_consolidation[:len(old_cons)] = old_cons
+            self._edge_capacity = new_cap
+
+    def add_edge(self, src: int, dst: int, weight: float):
+        idx = self._edge_count
+        self._ensure_capacity(idx + 1)
+        self._edge_src[idx] = src
+        self._edge_dst[idx] = dst
+        self._edge_w[idx] = weight
+        self._edge_tag[idx] = 0.0
+        self._edge_weak_count[idx] = 0
+        self._edge_count += 1
+        self._csr_dirty = True
+
+    def add_edges_batch(self, srcs: np.ndarray, dsts: np.ndarray, weights: np.ndarray):
+        """Add multiple edges at once (vectorized)."""
+        n_new = len(srcs)
+        if n_new == 0:
+            return
+        start = self._edge_count
+        self._ensure_capacity(start + n_new)
+        self._edge_src[start:start + n_new] = srcs
+        self._edge_dst[start:start + n_new] = dsts
+        self._edge_w[start:start + n_new] = weights
+        self._edge_tag[start:start + n_new] = 0.0
+        self._edge_weak_count[start:start + n_new] = 0
+        self._edge_count += n_new
+        self._csr_dirty = True
+
+    def existing_edge_set(self) -> set:
+        """Return set of (src, dst) tuples for all current edges."""
+        n = self._edge_count
+        return set(zip(self._edge_src[:n].tolist(), self._edge_dst[:n].tolist()))
+
+    def edge_count(self) -> int:
+        return self._edge_count
+
+    def get_weight_matrix(self) -> sparse.csr_matrix:
+        """CSR weight matrix W where W[dst, src] = weight."""
+        if self._csr_dirty or self._W_csr is None:
+            n = self._edge_count
+            self._W_csr = sparse.csr_matrix(
+                (self._edge_w[:n], (self._edge_dst[:n], self._edge_src[:n])),
+                shape=(self.n_nodes, self.n_nodes),
+            )
+            self._csr_dirty = False
+        return self._W_csr
+
+    def compact(self):
+        """Remove deleted edges (weight==0 markers)."""
+        n = self._edge_count
+        mask = self._edge_w[:n] != 0.0
+        alive = int(np.sum(mask))
+        self._edge_src[:alive] = self._edge_src[:n][mask]
+        self._edge_dst[:alive] = self._edge_dst[:n][mask]
+        self._edge_w[:alive] = self._edge_w[:n][mask]
+        self._edge_tag[:alive] = self._edge_tag[:n][mask]
+        self._edge_weak_count[:alive] = self._edge_weak_count[:n][mask]
+        self._edge_count = alive
+        self._csr_dirty = True
+
+    def save(self, path: Union[str, Path]) -> None:
+        n = self._edge_count
+        np.savez_compressed(
+            Path(path),
+            n_nodes=np.array([self.n_nodes]),
+            node_types=self.node_types,
+            regions=self.regions,
+            V=self.V,
+            threshold=self.threshold,
+            max_rate=np.array([self.max_rate]),
+            excitability=self.excitability,
+            leak_rates=self.leak_rates,
+            adaptation=self.adaptation,
+            adapt_rate=np.array([self.adapt_rate]),
+            adapt_decay=np.array([self.adapt_decay]),
+            f=self.f,
+            f_rate=np.array([self.f_rate]),
+            f_decay=np.array([self.f_decay]),
+            f_max=np.array([self.f_max]),
+            input_nodes=self.input_nodes,
+            output_nodes=self.output_nodes,
+            memory_nodes=self.memory_nodes,
+            edges_src=self._edge_src[:n].copy(),
+            edges_dst=self._edge_dst[:n].copy(),
+            edges_w=self._edge_w[:n].copy(),
+            edges_tag=self._edge_tag[:n].copy(),
+            edges_weak_count=self._edge_weak_count[:n].copy(),
+            column_ids=self.column_ids,
+            n_columns=np.array([self.n_columns]),
+            wta_k_frac=np.array([self.wta_k_frac]),
+            max_h=np.array([self.max_h]),
+            max_w=np.array([self.max_w]),
+            da=np.array([self.da]),
+            da_baseline=np.array([self.da_baseline]),
+            ach=np.array([self.ach]),
+            ne=np.array([self.ne]),
+        )
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "DNG":
+        data = np.load(path)
+        src = data["edges_src"]
+        dst = data["edges_dst"]
+        w = data["edges_w"]
+        n_edges = len(src)
+        cap = max(n_edges * 2, 1000)
+
+        net = cls(
+            n_nodes=int(data["n_nodes"][0]),
+            node_types=data["node_types"],
+            regions=data["regions"],
+            excitability=data["excitability"],
+            leak_rates=data["leak_rates"],
+            input_nodes=data["input_nodes"],
+            output_nodes=data["output_nodes"],
+        )
+        net.V = data["V"]
+        net.threshold = data["threshold"]
+        net.max_rate = float(data["max_rate"][0])
+        net.adaptation = data["adaptation"]
+        net.adapt_rate = float(data["adapt_rate"][0])
+        net.adapt_decay = float(data["adapt_decay"][0])
+        if "f" in data:
+            net.f = data["f"]
+            net.f_rate = float(data["f_rate"][0])
+            net.f_decay = float(data["f_decay"][0])
+            net.f_max = float(data["f_max"][0])
+        if "memory_nodes" in data:
+            net.memory_nodes = data["memory_nodes"]
+        if "column_ids" in data:
+            net.column_ids = data["column_ids"]
+            net.n_columns = int(data["n_columns"][0])
+            net.wta_k_frac = float(data["wta_k_frac"][0])
+        if "max_h" in data:
+            net.max_h = int(data["max_h"][0])
+            net.max_w = int(data["max_w"][0])
+        if "da" in data:
+            net.da = float(data["da"][0])
+            net.da_baseline = float(data["da_baseline"][0])
+            net.ach = float(data["ach"][0])
+            net.ne = float(data["ne"][0])
+        net._edge_src = np.empty(cap, dtype=np.int32)
+        net._edge_dst = np.empty(cap, dtype=np.int32)
+        net._edge_w = np.empty(cap, dtype=np.float64)
+        net._edge_tag = np.zeros(cap, dtype=np.float64)
+        net._edge_weak_count = np.zeros(cap, dtype=np.int32)
+        net._edge_src[:n_edges] = src
+        net._edge_dst[:n_edges] = dst
+        net._edge_w[:n_edges] = w
+        if "edges_tag" in data:
+            net._edge_tag[:n_edges] = data["edges_tag"]
+        if "edges_weak_count" in data:
+            net._edge_weak_count[:n_edges] = data["edges_weak_count"]
+        net._edge_count = n_edges
+        net._edge_capacity = cap
+        net._csr_dirty = True
+        net.compute_rates()
+        return net
