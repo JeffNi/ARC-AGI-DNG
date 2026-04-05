@@ -1,8 +1,8 @@
 """
 Activation dynamics modulated by neuromodulators.
 
-Uses Numba JIT-compiled kernels for the hot path.
-First call triggers ~1s compilation, then runs as native machine code.
+Auto-dispatches between GPU (CuPy) and CPU (Numba) kernels.
+GPU is used when available and the network is large enough (>=2000 nodes).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import numpy as np
 from .graph import DNG, Region
 from .encoding import NUM_COLORS
 from .numba_kernels import run_steps, run_steps_record
+from .gpu_kernels import use_gpu, gpu_run_steps, gpu_run_steps_record
 
 _REGION_ABSTRACT = list(Region).index(Region.ABSTRACT)
 _REGION_MEMORY = list(Region).index(Region.MEMORY)
@@ -65,7 +66,8 @@ def think(
 
     f_rate_eff = net.f_rate * (1.0 + net.ach)
 
-    run_steps(
+    _run = gpu_run_steps if use_gpu(net.n_nodes) else run_steps
+    _run(
         net.V, net.r, net.prev_r, net.f,
         net.threshold, net.leak_rates, net.excitability, net.adaptation,
         W_data, W_indices, W_indptr,
@@ -123,7 +125,8 @@ def record_think(
 
     f_rate_eff = net.f_rate * (1.0 + net.ach)
 
-    run_steps_record(
+    _run = gpu_run_steps_record if use_gpu(net.n_nodes) else run_steps_record
+    _run(
         net.V, net.r, net.prev_r, net.f,
         net.threshold, net.leak_rates, net.excitability, net.adaptation,
         W_data, W_indices, W_indptr,

@@ -85,7 +85,7 @@ def run_test(name, train_pairs, test_in, test_out, n_days=50, seed=42):
     config = make_config()
     print(f"Network: {net.n_nodes} nodes, {net.edge_count()} edges")
 
-    from src.plasticity import sleep_selective, prune_sustained, homeostatic_excitability_update
+    from src.plasticity import sleep_selective, prune_competitive, homeostatic_excitability_update
     ema_r = None
 
     for day in range(1, n_days + 1):
@@ -97,7 +97,7 @@ def run_test(name, train_pairs, test_in, test_out, n_days=50, seed=42):
         )
 
         sleep_selective(net, config.sleep_downscale, config.sleep_tag_threshold)
-        prune_sustained(net, config.prune_weak_threshold, config.prune_cycles_required)
+        prune_competitive(net, config.prune_weak_threshold)
         ema_r = homeostatic_excitability_update(net, ema_r=ema_r)
 
         if day <= 5 or day % 10 == 0 or result.reward >= 1.0:

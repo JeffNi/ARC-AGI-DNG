@@ -37,8 +37,10 @@ from .plasticity import (
     contrastive_hebbian_update,
     consolidate_synapses,
     get_weight_snapshot,
+    fast_hebbian_bind,
+    synaptic_scaling,
     homeostatic_excitability_update,
-    prune_sustained,
+    prune_competitive,
     sleep_selective,
     synaptogenesis,
 )
@@ -95,12 +97,22 @@ class LifecycleConfig:
     replay_steps: int = 20          # steps per replay phase
     replay_passes: int = 3          # how many times to cycle through all memories
 
+    # Consolidation
+    consolidation_decay: float = 0.98   # per-sleep decay: unreinforced synapses become plastic again
+    consolidation_strength: float = 0.5 # how much to consolidate on success (0 = disabled)
+    consolidation_threshold: float = 0.8  # minimum reward to trigger consolidation
+
     # Episodic memory (tensor buffer)
     memory_hint_strength: float = 1.0   # recalled outputs bias motor neurons (same scale as input)
     spontaneous_strength: float = 0.15  # faint associative signals during thinking
 
     # Focus signal
     focus_strength: float = 0.5
+
+    # Nursery (unsupervised infancy)
+    nursery_binding_eta: float = 0.08
+    nursery_growth_rate: float = 0.8
+    nursery_growth_candidates: int = 500000
 
     @classmethod
     def from_genome(cls, genome: Genome) -> "LifecycleConfig":
@@ -122,6 +134,33 @@ class AttemptResult:
     memory_snapshot: np.ndarray | None = None
     input_signal: np.ndarray | None = None
     full_signal: np.ndarray | None = None
+
+
+# ── Copy pathway suppression (for CHL free phase) ─────────────────
+
+def _suppress_sensory_to_motor(net: DNG):
+    """
+    Temporarily zero sensory→motor weights so internal processing
+    drives motor output during the CHL free phase.
+
+    Returns (mask, saved_weights) for restoration.
+    """
+    n = net._edge_count
+    _sensory = list(Region).index(Region.SENSORY)
+    _motor = list(Region).index(Region.MOTOR)
+    src_reg = net.regions[net._edge_src[:n]]
+    dst_reg = net.regions[net._edge_dst[:n]]
+    copy_mask = (src_reg == _sensory) & (dst_reg == _motor)
+    saved = net._edge_w[:n][copy_mask].copy()
+    net._edge_w[:n][copy_mask] = 0.0
+    net._csr_dirty = True
+    return copy_mask, saved
+
+
+def _restore_sensory_to_motor(net: DNG, copy_mask, saved):
+    """Restore sensory→motor weights after free phase."""
+    net._edge_w[:net._edge_count][copy_mask] = saved
+    net._csr_dirty = True
 
 
 _focus_cache: dict = {}
@@ -180,6 +219,203 @@ def _cell_confidence(
     return full_conf[:h, :w]
 
 
+# ── Nursery: unsupervised exposure for concept formation ─────────────
+
+@dataclass
+class NurseryResult:
+    grids_seen: int
+    edges_bound: int
+    edges_grown: int
+    edges_pruned: int
+    edges_after: int
+    synaptogenesis_stats: "object | None" = None  # last SynaptogenesisStats
+
+
+def nursery_exposure(
+    net: DNG,
+    grids: List[np.ndarray],
+    config: LifecycleConfig | None = None,
+    rng: np.random.Generator | None = None,
+    ema_r: np.ndarray | None = None,
+    maturity: float = 0.0,
+    base_threshold: np.ndarray | None = None,
+) -> Tuple[NurseryResult, np.ndarray]:
+    """
+    Unsupervised infancy: present grids with no task, just look.
+
+    Mimics biological infant visual development:
+      - Spontaneous activity waves sweep through ALL internal neurons
+        before each stimulus (like retinal waves), ensuring every
+        neuron participates in Hebbian binding.
+      - WTA competition starts weak (many neurons active) and
+        gradually tightens as maturity increases (0→1).
+      - Thresholds are lowered during infancy so neurons are
+        easily excitable.
+      - Hebbian binding + synaptogenesis build connections;
+        synaptic scaling prevents runaway potentiation.
+
+    maturity: 0.0 = newborn (weak WTA, low threshold, strong waves)
+              1.0 = end of infancy (normal WTA, normal threshold, no waves)
+    """
+    if config is None:
+        config = LifecycleConfig()
+    if rng is None:
+        rng = np.random.default_rng()
+    if base_threshold is None:
+        base_threshold = net.threshold.copy()
+
+    mh, mw = net.max_h, net.max_w
+    n_total = net.n_nodes
+
+    net.ach = 1.0
+    net.ne = 0.0
+    net.da = 0.0
+
+    abstract_region = list(Region).index(Region.ABSTRACT)
+    memory_region = list(Region).index(Region.MEMORY)
+    internal_nodes = np.where(net.regions == abstract_region)[0]
+    memory_nodes = np.where(net.regions == memory_region)[0]
+    developing_nodes = np.concatenate([internal_nodes, memory_nodes])
+    n_developing = len(developing_nodes)
+
+    # ── Developmental parameters based on maturity ─────────────────
+    # SET permanently -- the network's competition and thresholds should
+    # reflect its current developmental stage during measurements too.
+    adult_wta_k = 0.05
+    net.wta_k_frac = 0.30 * (1.0 - maturity) + adult_wta_k * maturity
+
+    threshold_scale = 0.3 + 0.7 * maturity
+    net.threshold[developing_nodes] = base_threshold[developing_nodes] * threshold_scale
+
+    # Inhibitory scaling: in biological infants, inhibitory circuits
+    # mature AFTER excitatory ones. Early E/I balance favors excitation,
+    # gradually shifting toward adult balance. Without this, inhibition
+    # dominates from birth, causing "pulse and crash" dynamics where
+    # one burst of activity triggers overwhelming inhibitory feedback.
+    net.inh_scale = 0.3 + 0.7 * maturity
+
+    # Excitability cap: prevent homeostatic excitability from amplifying
+    # the already-dense synaptic input by 5x during infancy. Starts low,
+    # rises to adult levels. This prevents the all-or-nothing firing that
+    # drives the pulse-crash cycle.
+    max_exc = 1.5 + 3.5 * maturity
+    net.excitability[developing_nodes] = np.clip(
+        net.excitability[developing_nodes], 0.1, max_exc,
+    )
+
+    wave_strength = 0.3 * (1.0 - maturity)
+
+    # Steady growth throughout infancy, no front-loading
+    growth_multiplier = 1.0
+
+    # Continuous update interval: every HOUR_SIZE grids, run synaptogenesis
+    # and homeostatic updates. This means a neuron that starts firing on
+    # grid 3 can grow connections by grid 5, and those new partners can
+    # be active by grid 6. Real brains wire continuously, not in daily batches.
+    HOUR_SIZE = 5
+    infant_homeo_eta = config.eta_b * (10.0 + 40.0 * (1.0 - maturity))
+    growth_per_hour = config.nursery_growth_rate * growth_multiplier
+    cands_per_hour = int(config.nursery_growth_candidates * growth_multiplier
+                         / max(1, len(grids) // HOUR_SIZE))
+
+    total_bound = 0
+    n_grown = 0
+    hourly_peak_r = np.zeros(net.n_nodes, dtype=np.float64)
+
+    for i, grid in enumerate(grids):
+        grid = np.asarray(grid)
+        gh, gw = grid.shape
+
+        # ── Spontaneous activity wave ──────────────────────────────
+        if wave_strength > 0.01:
+            n_cells = mh * mw
+            wave_phase = rng.random()
+            cell_assignments = np.arange(n_developing) % n_cells
+            cell_row = cell_assignments // mw
+            cell_col = cell_assignments % mw
+            wave_pos = (cell_row / max(1, mh - 1) + cell_col / max(1, mw - 1)) / 2.0
+            wave_val = np.cos(2 * np.pi * (wave_pos - wave_phase))
+            wave_val = np.maximum(wave_val, 0) * wave_strength
+            net.V[developing_nodes] += wave_val
+            net.r[developing_nodes] = np.maximum(
+                net.r[developing_nodes], wave_val * 0.5,
+            )
+
+        net.V[net.output_nodes] = 0.0
+        net.r[net.output_nodes] = 0.0
+        net.prev_r[net.output_nodes] = 0.0
+
+        focus = _focus_mask(net, gh, gw, config.focus_strength)
+        sig = grid_to_signal(grid, 0, n_total, max_h=mh, max_w=mw) + focus
+
+        think(net, signal=sig, steps=config.observe_steps,
+              noise_std=config.noise_std)
+
+        total_bound += fast_hebbian_bind(
+            net, eta=config.nursery_binding_eta, w_max=config.w_max,
+        )
+
+        np.maximum(hourly_peak_r, net.r, out=hourly_peak_r)
+
+        # ── Homeostatic excitability (every grid) ──────────────────
+        homeostatic_excitability_update(
+            net, eta_b=infant_homeo_eta, a_target=config.a_target, b_max=max_exc,
+        )
+
+        # ── Hourly tick: synaptogenesis + scaling ──────────────────
+        if (i + 1) % HOUR_SIZE == 0:
+            synaptic_scaling(net, target_total=2.0, region_filter=abstract_region)
+
+            # Use time-averaged activity for synaptogenesis so it sees
+            # all neurons that fired during the hour, not just the few
+            # surviving at the final snapshot (pulse-crash dynamics mean
+            # the snapshot captures <5% of actual participants).
+            saved_r = net.r.copy()
+            net.r[:] = hourly_peak_r
+
+            created, last_stats = synaptogenesis(
+                net,
+                growth_rate=growth_per_hour,
+                n_candidates=cands_per_hour,
+                rng=rng,
+                return_stats=True,
+            )
+
+            net.r[:] = saved_r
+            n_grown += created
+            hourly_peak_r[:] = 0.0
+
+    synaptic_scaling(net, target_total=2.0, region_filter=abstract_region)
+
+    rest(net, config)
+
+    # ── Child sleep: gentle downscaling + very slow pruning ─────────
+    # Synapses weaken during sleep (SHY hypothesis) and structural
+    # elimination does happen, but very slowly. At removal_rate=0.01,
+    # the weakest edge has ~1% chance of removal per night, meaning
+    # it survives ~100 nights on average before being eliminated.
+    child_downscale = 1.0 - (1.0 - config.sleep_downscale) * 0.2
+    sleep_selective(net, downscale=child_downscale,
+                    tag_threshold=config.sleep_tag_threshold)
+    n_pruned = prune_competitive(
+        net, weak_threshold=config.prune_weak_threshold,
+        removal_rate=0.01, rng=rng,
+    )
+
+    ema_r = homeostatic_excitability_update(
+        net, eta_b=config.eta_b, a_target=config.a_target, ema_r=ema_r,
+    )
+
+    return NurseryResult(
+        grids_seen=len(grids),
+        edges_bound=total_bound,
+        edges_grown=n_grown,
+        edges_pruned=n_pruned,
+        edges_after=net.edge_count(),
+        synaptogenesis_stats=last_stats if 'last_stats' in dir() else None,
+    ), ema_r
+
+
 # ── Study examples: observe + learn from worked examples (CHL) ───────
 
 def study_examples(
@@ -197,11 +433,14 @@ def observe_examples(
     train_pairs: List[Tuple[np.ndarray, np.ndarray]],
     config: LifecycleConfig | None = None,
     episodic: EpisodicMemory | None = None,
-) -> None:
+    binding_eta: float = 0.0,
+) -> int:
     """
-    Present training examples passively. NO weight changes.
-    Facilitation builds as pathways activate.
-    If episodic memory is provided, stores the examples for later recall.
+    Present training examples. Facilitation builds as pathways activate.
+    If binding_eta > 0, applies fast Hebbian binding after each example
+    (hippocampal one-shot learning on internal/motor edges).
+
+    Returns total number of edges modified by binding (0 if binding off).
     """
     if config is None:
         config = LifecycleConfig()
@@ -209,6 +448,7 @@ def observe_examples(
     mh, mw = net.max_h, net.max_w
     n_total = net.n_nodes
     motor_offset = int(net.output_nodes[0])
+    total_bound = 0
 
     for inp, out in train_pairs:
         inp, out = np.asarray(inp), np.asarray(out)
@@ -217,6 +457,10 @@ def observe_examples(
 
         if episodic is not None:
             episodic.store(inp, out)
+
+        net.V[net.output_nodes] = 0.0
+        net.r[net.output_nodes] = 0.0
+        net.prev_r[net.output_nodes] = 0.0
 
         focus = _focus_mask(net, max(in_h, out_h), max(in_w, out_w),
                             config.focus_strength)
@@ -228,8 +472,15 @@ def observe_examples(
         think(net, signal=sig, steps=config.observe_steps,
               noise_std=config.noise_std)
 
+        if binding_eta > 0:
+            total_bound += fast_hebbian_bind(
+                net, eta=binding_eta, w_max=config.w_max,
+            )
+
     think(net, signal=None, steps=config.observe_steps // 2,
           noise_std=config.noise_std)
+
+    return total_bound
 
 
 # ── Study task: learn from examples, then test without correction ────
@@ -247,9 +498,14 @@ def study_task_round(
     """
     One round of studying a task during childhood.
 
-    Episodic memory provides a recall hint during the free phase --
-    the network gets a nudge toward what stored examples suggest
-    the answer might look like.
+    Learning loop (as described in module docstring, now implemented):
+      1. Observe examples with fast Hebbian binding (hippocampal)
+      2. Free phase: think with test input, record correlations
+      3. Read guess, compute reward → DA = reward prediction error
+      4. Clamped phase: inject correct output, record correlations
+      5. CHL update: dw = eta * DA * ACh * (clamped - free)
+      6. Retry with refreshed observation if wrong
+      7. Restore Hebbian weight changes if task attempt made no progress
     """
     if config is None:
         config = LifecycleConfig()
@@ -264,14 +520,14 @@ def study_task_round(
     if is_first_visit:
         _soft_reset(net)
 
-    # Task-scope the episodic buffer so recall only uses THIS task's examples
-    if episodic is not None:
-        episodic.clear()
+    # Snapshot weights before Hebbian binding (task-local learning)
+    binding_eta = config.eta * 2.0 if config.eta > 0 else 0.0
+    w_snapshot = get_weight_snapshot(net) if binding_eta > 0 else None
 
-    # 1. Observe examples (builds facilitation, stores in episodic memory)
-    observe_examples(net, train_pairs, config, episodic=episodic)
+    # 1. Observe examples with fast Hebbian binding
+    observe_examples(net, train_pairs, config, episodic=episodic,
+                     binding_eta=binding_eta)
 
-    # Snapshot for sleep replay
     mem_mask = net.regions == list(Region).index(Region.MEMORY)
     mem_snapshot = net.r[mem_mask].copy()
 
@@ -283,7 +539,6 @@ def study_task_round(
     full_signal = (input_signal +
                    grid_to_signal(test_output, motor_offset, n_total, max_h=mh, max_w=mw))
 
-    # Compute recall hint from episodic memory
     recall_hint = np.zeros(n_total)
     if episodic is not None:
         recall_hint = episodic.recall_signal(
@@ -295,44 +550,58 @@ def study_task_round(
     best_reward = prev_best_reward
     total_attempts = 0
 
-    w_snapshot = get_weight_snapshot(net)
-
     for attempt in range(1, config.attempts_per_round + 1):
         total_attempts = attempt
 
-        # 2. Think: test input + episodic recall hint
         focus = _focus_mask(net, max(in_h, out_h), max(in_w, out_w),
                             config.focus_strength)
         test_signal = (grid_to_signal(test_input, 0, n_total,
                                       max_h=mh, max_w=mw) + focus + recall_hint)
 
-        free_corr = record_phase(
-            net, step, test_signal,
-            config.free_phase_steps, config.noise_std,
-        )
+        # 2. Free phase: suppress copy pathway so internal neurons
+        #    actually have to produce the answer (not just copy input).
+        #    This gives CHL a meaningful learning signal.
+        if config.eta > 0:
+            net.V[net.output_nodes] = 0.0
+            net.r[net.output_nodes] = 0.0
+            net.prev_r[net.output_nodes] = 0.0
+
+            copy_mask, copy_saved = _suppress_sensory_to_motor(net)
+            free_corr = record_think(
+                net, signal=test_signal,
+                steps=config.free_phase_steps,
+                noise_std=config.noise_std,
+            )
+            _restore_sensory_to_motor(net, copy_mask, copy_saved)
+        else:
+            think(net, signal=test_signal, steps=config.think_steps,
+                  noise_std=config.noise_std)
 
         guess = signal_to_grid(net.r, out_h, out_w,
                                node_offset=motor_offset, max_h=mh, max_w=mw)
         fg = test_output != 0
         reward = float(np.mean(guess[fg] == test_output[fg])) if fg.any() else 1.0
 
-        # 3. CHL: show the correct answer
-        clamped_signal = (test_signal +
-                          grid_to_signal(test_output, motor_offset, n_total,
-                                         max_h=mh, max_w=mw))
-        clamped_corr = record_phase(
-            net, step, clamped_signal,
-            config.clamped_phase_steps, config.noise_std * 0.5,
-        )
+        # 3-5. CHL update: clamped phase (with copy restored) + reward-modulated weight change
+        if config.eta > 0:
+            rpe = reward - net.da_baseline
+            net.da = max(abs(rpe), 0.1)
+            net.da_baseline = 0.9 * net.da_baseline + 0.1 * reward
 
-        net.da = max(0.1, 1.0 - reward)
-        net.ne = min(1.0, (1.0 - reward) * 1.5)
+            net.V[net.output_nodes] = 0.0
+            net.r[net.output_nodes] = 0.0
+            net.prev_r[net.output_nodes] = 0.0
 
-        contrastive_hebbian_update(
-            net, free_corr, clamped_corr,
-            eta=config.eta,
-            w_max=config.w_max,
-        )
+            clamped_corr = record_think(
+                net, signal=full_signal,
+                steps=config.clamped_phase_steps,
+                noise_std=config.noise_std * 0.5,
+            )
+
+            contrastive_hebbian_update(
+                net, free_corr, clamped_corr,
+                eta=config.eta, w_max=config.w_max,
+            )
 
         if reward > best_reward:
             best_reward = reward
@@ -342,13 +611,18 @@ def study_task_round(
             break
 
         if attempt < config.attempts_per_round:
-            observe_examples(net, train_pairs, config, episodic=episodic)
+            observe_examples(net, train_pairs, config, episodic=episodic,
+                             binding_eta=binding_eta)
 
-    # Consolidate synapses that changed during successful learning.
-    # Only triggers on high performance; accumulates gradually so
-    # synapses confirmed important by repeated success become very stable.
-    consolidate_synapses(net, w_snapshot, best_reward,
-                         reward_threshold=0.8, consolidation_strength=0.5)
+    # Consolidate weight changes if reward improved; restore on regression.
+    # Biologically: you can't un-learn seeing the answer, but selective
+    # sleep downscaling handles removing unused associations over time.
+    # Only revert if the task was genuinely worse than the previous best
+    # (which can happen if prev_best was set by a prior round).
+    if w_snapshot is not None and best_reward == 0.0 and prev_best_reward > 0.0:
+        n = min(len(w_snapshot), net._edge_count)
+        net._edge_w[:n] = w_snapshot[:n]
+        net._csr_dirty = True
 
     net.ne *= 0.3
 
@@ -437,13 +711,6 @@ def study_day(
 
             np.maximum(daily_peak_r, net.r, out=daily_peak_r)
 
-            if rnd == 0 and result.memory_snapshot is not None:
-                if replay_buffer is not None:
-                    task_key = hash(test_in.tobytes())
-                    replay_buffer[task_key] = (result.memory_snapshot,
-                                               result.input_signal,
-                                               result.full_signal)
-
             total_attempts[i] += result.n_attempts
 
             if result.reward > best_rewards[i]:
@@ -483,17 +750,8 @@ def study_day(
     )
     net.r[:] = saved_r
 
-    # Sleep replays ALL accumulated memories, not just today's.
-    # Cap buffer to prevent unbounded growth with many tasks.
-    MAX_REPLAY_MEMORIES = 50
-    if replay_buffer is not None and len(replay_buffer) > MAX_REPLAY_MEMORIES:
-        keys = list(replay_buffer.keys())
-        for k in keys[:len(keys) - MAX_REPLAY_MEMORIES]:
-            del replay_buffer[k]
-    all_memories = list((replay_buffer or {}).values())
-
     rest(net, config)
-    n_pruned, ema_r = sleep(net, config, ema_r, rng, day_memories=all_memories)
+    n_pruned, ema_r = sleep(net, config, ema_r, rng, episodic=episodic)
 
     mean_reward = float(np.mean([a.reward for a in attempts]))
     return DayResult(
@@ -517,75 +775,107 @@ def sleep(
     ema_r: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
     day_memories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    episodic: EpisodicMemory | None = None,
+    n_cycles: int = 4,
 ) -> Tuple[int, np.ndarray]:
     """
-    Sleep phase: replay, consolidation, pruning, homeostasis.
+    Sleep phase: interleaved NREM/REM cycles, like a real night's sleep.
 
-    Replay: reactivate each stored memory pattern, let it drive the
-    network (free phase), then clamp the correct signal (clamped phase),
-    and apply gentle CHL. Interleaved across all memories to prevent
-    any single task from dominating weight changes.
+    Real sleep alternates ~4-5 times between:
+      NREM: synaptic downscaling, gradual pruning, consolidation
+      REM:  episodic replay with gentle CHL learning
+
+    Each cycle does a fraction of the total work, so changes are
+    gradual and interleaved -- not one big batch.
     """
     if config is None:
         config = LifecycleConfig()
+    if rng is None:
+        rng = np.random.default_rng()
 
     saved_ach = net.ach
     saved_da = net.da
     net.ne = 0.0
 
-    mem_mask = net.regions == list(Region).index(Region.MEMORY)
+    mh, mw = net.max_h, net.max_w
+    n_total = net.n_nodes
+    motor_offset = int(net.output_nodes[0])
 
-    # ── Sleep replay: consolidate day's memories ──────────────────
-    # ACh and DA are elevated during REM sleep to enable consolidation.
-    if day_memories and config.replay_eta > 0:
-        net.ach = 1.0
-        net.da = 1.0
-        for _pass in range(config.replay_passes):
-            for mem_snapshot, input_signal, full_signal in day_memories:
-                # Inject stored memory pattern
-                net.r[mem_mask] = mem_snapshot
-                net.V[mem_mask] = mem_snapshot + net.threshold[mem_mask]
+    has_memories = (episodic is not None and len(episodic.episodes) > 0
+                    and config.replay_eta > 0)
 
-                # Free replay: memory + sensory input → what does the network produce?
+    # Per-cycle downscale: total effect across all cycles equals
+    # the original single-shot downscale.
+    # downscale^1 = per_cycle^n_cycles  =>  per_cycle = downscale^(1/n_cycles)
+    per_cycle_downscale = config.sleep_downscale ** (1.0 / n_cycles)
+    per_cycle_consolidation = config.consolidation_decay ** (1.0 / n_cycles)
+
+    total_pruned = 0
+
+    for cycle in range(n_cycles):
+        # ── NREM phase: downscale + prune (gradual) ────────────────
+        net.ach = 0.1
+        net.da = 0.0
+
+        sleep_selective(net, downscale=per_cycle_downscale,
+                        tag_threshold=config.sleep_tag_threshold)
+        n_pruned = prune_competitive(
+            net, weak_threshold=config.prune_weak_threshold, rng=rng,
+        )
+        total_pruned += n_pruned
+
+        n = net._edge_count
+        net._edge_consolidation[:n] *= per_cycle_consolidation
+
+        # ── REM phase: replay a subset of memories ─────────────────
+        if has_memories:
+            net.ach = 0.5
+            net.da = 0.5
+
+            episodes = episodic.episodes
+            n_eps = len(episodes)
+            # Each cycle replays a fraction of episodes (shuffled)
+            order = rng.permutation(n_eps)
+            n_replay = max(1, n_eps // n_cycles)
+            for idx in order[:n_replay]:
+                ep = episodes[idx]
+                inp, out = ep.input_grid, ep.output_grid
+                in_h, in_w = inp.shape
+                out_h, out_w = out.shape
+
+                focus = _focus_mask(net, max(in_h, out_h), max(in_w, out_w),
+                                    config.focus_strength)
+                input_signal = (
+                    grid_to_signal(inp, 0, n_total, max_h=mh, max_w=mw) + focus
+                )
+                full_signal = (
+                    input_signal +
+                    grid_to_signal(out, motor_offset, n_total, max_h=mh, max_w=mw)
+                )
+
                 free_corr = record_think(
                     net, signal=input_signal,
                     steps=config.replay_steps,
                     noise_std=config.noise_std * 0.5,
                 )
-
-                # Re-inject memory before clamped phase
-                net.r[mem_mask] = mem_snapshot
-                net.V[mem_mask] = mem_snapshot + net.threshold[mem_mask]
-
-                # Clamped replay: memory + input + correct output
                 clamped_corr = record_think(
                     net, signal=full_signal,
                     steps=config.replay_steps,
                     noise_std=config.noise_std * 0.3,
                 )
-
                 contrastive_hebbian_update(
                     net, free_corr, clamped_corr,
                     eta=config.replay_eta,
                     w_max=config.w_max,
                 )
 
-    # ── Non-REM: quiet phase for downscaling/pruning ─────────────
-    net.ach = 0.1
-    net.da = 0.0
-
-    # ── Synaptic downscaling + pruning ────────────────────────────
-    sleep_selective(net, downscale=config.sleep_downscale,
-                    tag_threshold=config.sleep_tag_threshold)
-    n_pruned = prune_sustained(net, weak_threshold=config.prune_weak_threshold,
-                               cycles_required=config.prune_cycles_required)
-
-    ema_r = homeostatic_excitability_update(
-        net, eta_b=config.eta_b, a_target=config.a_target, ema_r=ema_r,
-    )
+        # Brief homeostatic adjustment between cycles
+        ema_r = homeostatic_excitability_update(
+            net, eta_b=config.eta_b, a_target=config.a_target, ema_r=ema_r,
+        )
 
     net.ach = saved_ach
-    return n_pruned, ema_r
+    return total_pruned, ema_r
 
 
 # ── Adult solve: NO weight changes ──────────────────────────────────
@@ -630,9 +920,9 @@ def solve_task(
 
     _soft_reset(net)
 
-    # Task-scope the episodic buffer so recall only uses THIS task's examples
+    # Store this task's examples (episodic memory accumulates across tasks).
+    # Recall is similarity-based so only relevant examples contribute.
     if episodic is not None:
-        episodic.clear()
         episodic.store_pairs(train_pairs)
     observe_examples(net, train_pairs, config, episodic=episodic)
 

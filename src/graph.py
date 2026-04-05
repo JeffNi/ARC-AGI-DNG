@@ -96,7 +96,7 @@ class DNG:
 
     # Neuromodulators (global scalars)
     da: float = 0.0           # dopamine: reward prediction error
-    da_baseline: float = 0.3  # running average of recent rewards
+    da_baseline: float = 0.0  # running average of recent rewards (starts at 0 = no expectations)
     ach: float = 1.0          # acetylcholine: learning mode (1=childhood, 0=adult)
     ne: float = 0.0           # norepinephrine: surprise/arousal
 
@@ -126,6 +126,10 @@ class DNG:
     column_ids: np.ndarray = field(default=None, repr=False)
     n_columns: int = field(default=0, repr=False)
     wta_k_frac: float = field(default=0.2, repr=False)
+
+    # Developmental inhibitory scaling (1.0 = adult, <1.0 = immature)
+    inh_scale: float = field(default=1.0, repr=False)
+    _last_inh_scale: float = field(default=1.0, repr=False)
 
     # Type masks
     _mask_I: np.ndarray = field(default=None, repr=False)
@@ -237,14 +241,26 @@ class DNG:
         return self._edge_count
 
     def get_weight_matrix(self) -> sparse.csr_matrix:
-        """CSR weight matrix W where W[dst, src] = weight."""
-        if self._csr_dirty or self._W_csr is None:
+        """CSR weight matrix W where W[dst, src] = weight.
+
+        Applies inh_scale to inhibitory (negative) weights so the stored
+        edge weights remain at their "adult" values while the matrix used
+        for dynamics reflects the current developmental E/I balance.
+        """
+        scale_changed = self._last_inh_scale != self.inh_scale
+        if self._csr_dirty or self._W_csr is None or scale_changed:
             n = self._edge_count
+            w = self._edge_w[:n]
+            if self.inh_scale != 1.0:
+                w = w.copy()
+                neg = w < 0
+                w[neg] *= self.inh_scale
             self._W_csr = sparse.csr_matrix(
-                (self._edge_w[:n], (self._edge_dst[:n], self._edge_src[:n])),
+                (w, (self._edge_dst[:n], self._edge_src[:n])),
                 shape=(self.n_nodes, self.n_nodes),
             )
             self._csr_dirty = False
+            self._last_inh_scale = self.inh_scale
         return self._W_csr
 
     def compact(self):
@@ -287,6 +303,7 @@ class DNG:
             edges_w=self._edge_w[:n].copy(),
             edges_tag=self._edge_tag[:n].copy(),
             edges_weak_count=self._edge_weak_count[:n].copy(),
+            edges_consolidation=self._edge_consolidation[:n].copy(),
             column_ids=self.column_ids,
             n_columns=np.array([self.n_columns]),
             wta_k_frac=np.array([self.wta_k_frac]),
@@ -296,6 +313,7 @@ class DNG:
             da_baseline=np.array([self.da_baseline]),
             ach=np.array([self.ach]),
             ne=np.array([self.ne]),
+            inh_scale=np.array([self.inh_scale]),
         )
 
     @classmethod
@@ -341,6 +359,9 @@ class DNG:
             net.da_baseline = float(data["da_baseline"][0])
             net.ach = float(data["ach"][0])
             net.ne = float(data["ne"][0])
+        if "inh_scale" in data:
+            net.inh_scale = float(data["inh_scale"][0])
+            net._last_inh_scale = net.inh_scale
         net._edge_src = np.empty(cap, dtype=np.int32)
         net._edge_dst = np.empty(cap, dtype=np.int32)
         net._edge_w = np.empty(cap, dtype=np.float64)
@@ -353,8 +374,12 @@ class DNG:
             net._edge_tag[:n_edges] = data["edges_tag"]
         if "edges_weak_count" in data:
             net._edge_weak_count[:n_edges] = data["edges_weak_count"]
+        net._edge_consolidation = np.zeros(cap, dtype=np.float64)
+        if "edges_consolidation" in data:
+            net._edge_consolidation[:n_edges] = data["edges_consolidation"]
         net._edge_count = n_edges
         net._edge_capacity = cap
         net._csr_dirty = True
+        net._build_type_masks()
         net.compute_rates()
         return net
