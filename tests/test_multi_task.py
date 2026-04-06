@@ -133,7 +133,7 @@ for task in selected:
                                     max_h=MAX_H, max_w=MAX_W)
             think(net_task, signal=sig_in, steps=INPUT_STEPS, noise_std=NOISE)
 
-            guess = signal_to_grid(net_task.r, out.shape[0], out.shape[1],
+            guess = signal_to_grid(net_task.V, out.shape[0], out.shape[1],
                                    node_offset=motor_offset,
                                    max_h=MAX_H, max_w=MAX_W)
             train_acc += float(np.mean(guess == out))
@@ -165,7 +165,7 @@ for task in selected:
 
             think(net_task, signal=grid_to_signal(test_in, 0, n, max_h=MAX_H, max_w=MAX_W),
                   steps=120, noise_std=NOISE * 0.3)
-            pred = signal_to_grid(net_task.r, out_h, out_w,
+            pred = signal_to_grid(net_task.V, out_h, out_w,
                                   node_offset=motor_offset,
                                   max_h=MAX_H, max_w=MAX_W)
             test_acc = float(np.mean(pred == test_out))

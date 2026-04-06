@@ -1,17 +1,14 @@
 """
-DNG lifecycle: reasoning via contrastive Hebbian learning.
+DNG lifecycle: error-corrective three-factor learning.
 
 Two modes:
-  CHILDHOOD (weight changes via CHL):
-    1. Set ACh high (learning mode)
-    2. Observe training examples (facilitation builds, no weight change)
-    3. Free phase: think with test input, record correlations (network's guess)
-    4. Read guess, compute reward
-    5. Set DA = reward prediction error, NE = surprise
-    6. Clamped phase: inject correct output, record correlations
-    7. CHL update: dw = eta * DA * ACh * (clamped - free)
-    8. Retry if wrong (round-robin across tasks, multiple rounds)
-    9. Sleep at end of day
+  CHILDHOOD (error-corrective learning):
+    1. Observe training examples (priming only — facilitation, episodic store)
+    2. Attempt: think with test input, record activity, read guess
+    3. Compute signed motor error (target - guess activity)
+    4. Inject error at motor, propagate through feedback connections
+    5. Three-factor update: dw = eta * pre * delta_post * DA
+    6. Repeat if not solved; sleep at end of day
 
   ADULT / SOLVE (no weight changes):
     1. Set ACh low (recall mode), no DA/NE modulation
@@ -38,6 +35,7 @@ from .plasticity import (
     consolidate_synapses,
     get_weight_snapshot,
     fast_hebbian_bind,
+    error_corrective_update,
     synaptic_scaling,
     homeostatic_excitability_update,
     prune_competitive,
@@ -54,11 +52,10 @@ class LifecycleConfig:
     think_steps: int = 80
     consolidation_steps: int = 20
 
-    # CHL learning (childhood only)
+    # Error-corrective learning (three-factor, cerebellar model)
     eta: float = 0.05
     w_max: float = 2.5
-    free_phase_steps: int = 40
-    clamped_phase_steps: int = 40
+    error_prop_steps: int = 15   # steps to propagate error signal through feedback
 
     # Retry (round-robin)
     attempts_per_round: int = 3
@@ -80,9 +77,10 @@ class LifecycleConfig:
     sleep_downscale: float = 0.95
     sleep_tag_threshold: float = 0.01
 
-    # Pruning (sustained weakness)
+    # Pruning (competitive probabilistic)
     prune_weak_threshold: float = 0.01
-    prune_cycles_required: int = 5
+    prune_removal_rate: float = 0.3     # probability scale: 0.3=adult, 0.01=child
+    prune_cycles_required: int = 5      # legacy, unused by prune_competitive
 
     # Synaptogenesis (edge growth -- probability-based, modulated by ACh)
     growth_rate: float = 0.3          # base probability scale for new connections
@@ -93,7 +91,7 @@ class LifecycleConfig:
     t_max: int = 300
 
     # Sleep replay (consolidation)
-    replay_eta: float = 0.003       # gentle CHL during replay (with DA=1,ACh=1 → effective 0.003)
+    replay_eta: float = 0.003       # gentle contrastive update during sleep replay
     replay_steps: int = 20          # steps per replay phase
     replay_passes: int = 3          # how many times to cycle through all memories
 
@@ -134,33 +132,6 @@ class AttemptResult:
     memory_snapshot: np.ndarray | None = None
     input_signal: np.ndarray | None = None
     full_signal: np.ndarray | None = None
-
-
-# ── Copy pathway suppression (for CHL free phase) ─────────────────
-
-def _suppress_sensory_to_motor(net: DNG):
-    """
-    Temporarily zero sensory→motor weights so internal processing
-    drives motor output during the CHL free phase.
-
-    Returns (mask, saved_weights) for restoration.
-    """
-    n = net._edge_count
-    _sensory = list(Region).index(Region.SENSORY)
-    _motor = list(Region).index(Region.MOTOR)
-    src_reg = net.regions[net._edge_src[:n]]
-    dst_reg = net.regions[net._edge_dst[:n]]
-    copy_mask = (src_reg == _sensory) & (dst_reg == _motor)
-    saved = net._edge_w[:n][copy_mask].copy()
-    net._edge_w[:n][copy_mask] = 0.0
-    net._csr_dirty = True
-    return copy_mask, saved
-
-
-def _restore_sensory_to_motor(net: DNG, copy_mask, saved):
-    """Restore sensory→motor weights after free phase."""
-    net._edge_w[:net._edge_count][copy_mask] = saved
-    net._csr_dirty = True
 
 
 _focus_cache: dict = {}
@@ -204,15 +175,16 @@ def _focus_mask(
 
 
 def _cell_confidence(
-    rates: np.ndarray,
+    values: np.ndarray,
     motor_offset: int,
     h: int,
     w: int,
     max_h: int,
     max_w: int,
 ) -> np.ndarray:
+    """Gap between top-2 motor neuron values per cell (works with V or r)."""
     n_cells = max_h * max_w
-    motor_r = rates[motor_offset : motor_offset + n_cells * NUM_COLORS]
+    motor_r = values[motor_offset : motor_offset + n_cells * NUM_COLORS]
     motor_r = motor_r.reshape(n_cells, NUM_COLORS)
     full_conf = np.partition(motor_r, -2, axis=1)
     full_conf = (full_conf[:, -1] - full_conf[:, -2]).reshape(max_h, max_w)
@@ -434,11 +406,13 @@ def observe_examples(
     config: LifecycleConfig | None = None,
     episodic: EpisodicMemory | None = None,
     binding_eta: float = 0.0,
+    extra_signal: np.ndarray | None = None,
 ) -> int:
     """
     Present training examples. Facilitation builds as pathways activate.
-    If binding_eta > 0, applies fast Hebbian binding after each example
-    (hippocampal one-shot learning on internal/motor edges).
+
+    During childhood, binding_eta=0 (priming only). During infancy,
+    binding_eta > 0 applies fast Hebbian binding after each example.
 
     Returns total number of edges modified by binding (0 if binding off).
     """
@@ -468,6 +442,8 @@ def observe_examples(
         sig = (grid_to_signal(inp, 0, n_total, max_h=mh, max_w=mw) +
                grid_to_signal(out, motor_offset, n_total, max_h=mh, max_w=mw) +
                focus)
+        if extra_signal is not None:
+            sig = sig + extra_signal
 
         think(net, signal=sig, steps=config.observe_steps,
               noise_std=config.noise_std)
@@ -483,7 +459,7 @@ def observe_examples(
     return total_bound
 
 
-# ── Study task: learn from examples, then test without correction ────
+# ── Study task: error-corrective three-factor learning ────────────
 
 def study_task_round(
     net: DNG,
@@ -498,14 +474,14 @@ def study_task_round(
     """
     One round of studying a task during childhood.
 
-    Learning loop (as described in module docstring, now implemented):
-      1. Observe examples with fast Hebbian binding (hippocampal)
-      2. Free phase: think with test input, record correlations
-      3. Read guess, compute reward → DA = reward prediction error
-      4. Clamped phase: inject correct output, record correlations
-      5. CHL update: dw = eta * DA * ACh * (clamped - free)
-      6. Retry with refreshed observation if wrong
-      7. Restore Hebbian weight changes if task attempt made no progress
+    Learning flow (cerebellar error-corrective model):
+      1. Observe examples — priming only, no weight changes
+      2. Attempt: think with test input, record activity, read guess
+      3. Compute signed motor error (target - guess activity)
+      4. Inject error at motor, propagate through feedback connections
+      5. Three-factor update: dw = eta * pre * delta_post * DA
+      6. Update DA baseline from reward prediction error
+      7. Repeat if not solved
     """
     if config is None:
         config = LifecycleConfig()
@@ -520,13 +496,12 @@ def study_task_round(
     if is_first_visit:
         _soft_reset(net)
 
-    # Snapshot weights before Hebbian binding (task-local learning)
-    binding_eta = config.eta * 2.0 if config.eta > 0 else 0.0
-    w_snapshot = get_weight_snapshot(net) if binding_eta > 0 else None
+    # Snapshot weights so we can revert if the task goes badly
+    w_snapshot = get_weight_snapshot(net) if config.eta > 0 else None
 
-    # 1. Observe examples with fast Hebbian binding
+    # 1. Observe examples — priming only (facilitation, episodic store)
     observe_examples(net, train_pairs, config, episodic=episodic,
-                     binding_eta=binding_eta)
+                     binding_eta=0.0)
 
     mem_mask = net.regions == list(Region).index(Region.MEMORY)
     mem_snapshot = net.r[mem_mask].copy()
@@ -538,6 +513,10 @@ def study_task_round(
                     replay_focus)
     full_signal = (input_signal +
                    grid_to_signal(test_output, motor_offset, n_total, max_h=mh, max_w=mw))
+
+    # Target signal at motor neurons (what correct output looks like)
+    target_motor = grid_to_signal(test_output, motor_offset, n_total,
+                                  max_h=mh, max_w=mw)
 
     recall_hint = np.zeros(n_total)
     if episodic is not None:
@@ -558,50 +537,21 @@ def study_task_round(
         test_signal = (grid_to_signal(test_input, 0, n_total,
                                       max_h=mh, max_w=mw) + focus + recall_hint)
 
-        # 2. Free phase: suppress copy pathway so internal neurons
-        #    actually have to produce the answer (not just copy input).
-        #    This gives CHL a meaningful learning signal.
-        if config.eta > 0:
-            net.V[net.output_nodes] = 0.0
-            net.r[net.output_nodes] = 0.0
-            net.prev_r[net.output_nodes] = 0.0
+        # 2. Attempt: think with test input only
+        think(net, signal=test_signal, steps=config.think_steps,
+              noise_std=config.noise_std)
 
-            copy_mask, copy_saved = _suppress_sensory_to_motor(net)
-            free_corr = record_think(
-                net, signal=test_signal,
-                steps=config.free_phase_steps,
-                noise_std=config.noise_std,
-            )
-            _restore_sensory_to_motor(net, copy_mask, copy_saved)
-        else:
-            think(net, signal=test_signal, steps=config.think_steps,
-                  noise_std=config.noise_std)
+        r_guess = net.r.copy()
 
-        guess = signal_to_grid(net.r, out_h, out_w,
+        guess = signal_to_grid(net.V, out_h, out_w,
                                node_offset=motor_offset, max_h=mh, max_w=mw)
         fg = test_output != 0
         reward = float(np.mean(guess[fg] == test_output[fg])) if fg.any() else 1.0
 
-        # 3-5. CHL update: clamped phase (with copy restored) + reward-modulated weight change
-        if config.eta > 0:
-            rpe = reward - net.da_baseline
-            net.da = max(abs(rpe), 0.1)
-            net.da_baseline = 0.9 * net.da_baseline + 0.1 * reward
-
-            net.V[net.output_nodes] = 0.0
-            net.r[net.output_nodes] = 0.0
-            net.prev_r[net.output_nodes] = 0.0
-
-            clamped_corr = record_think(
-                net, signal=full_signal,
-                steps=config.clamped_phase_steps,
-                noise_std=config.noise_std * 0.5,
-            )
-
-            contrastive_hebbian_update(
-                net, free_corr, clamped_corr,
-                eta=config.eta, w_max=config.w_max,
-            )
+        # 3. Update DA from reward prediction error
+        rpe = reward - net.da_baseline
+        net.da = max(abs(rpe), 0.1)
+        net.da_baseline = 0.9 * net.da_baseline + 0.1 * reward
 
         if reward > best_reward:
             best_reward = reward
@@ -610,16 +560,35 @@ def study_task_round(
         if reward >= 1.0:
             break
 
-        if attempt < config.attempts_per_round:
-            observe_examples(net, train_pairs, config, episodic=episodic,
-                             binding_eta=binding_eta)
+        # 4. Error injection: signed correction at motor neurons.
+        #    Motor WTA in dynamics gives differentiated rates, so error
+        #    has both + (strengthen correct) and - (weaken wrong) components.
+        motor_r = net.r[net.output_nodes]
+        target_r = target_motor[net.output_nodes]
+        error_signal = np.zeros(n_total)
+        error_signal[net.output_nodes] = target_r - motor_r
 
-    # Consolidate weight changes if reward improved; restore on regression.
-    # Biologically: you can't un-learn seeing the answer, but selective
-    # sleep downscaling handles removing unused associations over time.
-    # Only revert if the task was genuinely worse than the previous best
-    # (which can happen if prev_best was set by a prior round).
-    if w_snapshot is not None and best_reward == 0.0 and prev_best_reward > 0.0:
+        # 5. Propagate error through feedback connections.
+        #    Low noise so the error signal dominates over stochastic activity.
+        think(net, signal=error_signal, steps=config.error_prop_steps,
+              noise_std=config.noise_std * 0.25)
+
+        r_corrected = net.r.copy()
+
+        # 6. Three-factor update: pre * delta_post * DA
+        #    Uses r_guess with sharpened motor (decision signal) but raw
+        #    abstract/sensory rates (pre-synaptic activity from full dynamics).
+        if config.eta > 0:
+            error_corrective_update(
+                net, r_guess, r_corrected,
+                eta=config.eta, w_max=config.w_max,
+            )
+
+    # Revert weights if the task didn't improve. Failed learning attempts
+    # on one task corrupt weights that other tasks depend on. Rolling back
+    # when there's no progress prevents catastrophic interference while
+    # still allowing exploration on the attempts that did help.
+    if w_snapshot is not None and best_reward <= prev_best_reward:
         n = min(len(w_snapshot), net._edge_count)
         net._edge_w[:n] = w_snapshot[:n]
         net._csr_dirty = True
@@ -634,6 +603,38 @@ def study_task_round(
         input_signal=input_signal,
         full_signal=full_signal,
     )
+
+
+def _sharpen_motor(
+    r: np.ndarray,
+    output_nodes: np.ndarray,
+    out_h: int, out_w: int,
+    max_h: int, max_w: int,
+) -> np.ndarray:
+    """Per-cell WTA on motor neurons: keep only the winning color per position.
+
+    Applied as post-processing for the learning rule, NOT during dynamics.
+    This gives the three-factor update a clean decision signal (the network's
+    "guess") while the actual dynamics keep motor neurons unsuppressed to
+    maintain abstract layer excitation via recurrence.
+
+    Sharpens ALL motor cells so unused positions don't leak saturated rates
+    into the three-factor update's pre-synaptic terms.
+    """
+    r_sharp = r.copy()
+    n_cells = max_h * max_w
+    n_colors = NUM_COLORS
+    motor_start = int(output_nodes[0])
+    for cell in range(n_cells):
+        base = motor_start + cell * n_colors
+        if base + n_colors > len(r_sharp):
+            break
+        block = r_sharp[base:base + n_colors]
+        winner = np.argmax(block)
+        for c in range(n_colors):
+            if c != winner:
+                block[c] = 0.0
+    return r_sharp
 
 
 def _soft_reset(net: DNG) -> None:
@@ -693,7 +694,13 @@ def study_day(
     solved = [False] * n_tasks
     stuck = [False] * n_tasks
 
-    daily_peak_r = np.zeros(net.n_nodes, dtype=np.float64)
+    # Synaptogenesis after each task study, matching infancy's per-grid
+    # pattern. Peak activity accumulated within each task's study round
+    # provides the co-activation signal for "fire together, wire together."
+    n_active_tasks = sum(1 for _ in tasks)
+    n_grow_calls = max(1, n_active_tasks * config.n_rounds)
+    cands_per_call = max(1, config.growth_candidates // n_grow_calls)
+    n_grown = 0
 
     for rnd in range(config.n_rounds):
         any_active = False
@@ -709,8 +716,6 @@ def study_day(
                 episodic=episodic,
             )
 
-            np.maximum(daily_peak_r, net.r, out=daily_peak_r)
-
             total_attempts[i] += result.n_attempts
 
             if result.reward > best_rewards[i]:
@@ -721,6 +726,16 @@ def study_day(
 
             if result.reward >= 1.0:
                 solved[i] = True
+
+            # Synaptogenesis after each task using current activity.
+            # Each task activates different neurons, providing the
+            # diverse co-activation patterns growth needs.
+            n_grown += synaptogenesis(
+                net,
+                growth_rate=config.growth_rate,
+                n_candidates=cands_per_call,
+                rng=rng,
+            )
 
         if not any_active:
             break
@@ -740,18 +755,25 @@ def study_day(
         for i in range(n_tasks)
     ]
 
-    saved_r = net.r.copy()
-    net.r[:] = daily_peak_r
-    n_grown = synaptogenesis(
-        net,
-        growth_rate=config.growth_rate,
-        n_candidates=config.growth_candidates,
-        rng=rng,
-    )
-    net.r[:] = saved_r
+    # Synaptic scaling (same as infancy)
+    abstract_region = list(Region).index(Region.ABSTRACT)
+    synaptic_scaling(net, target_total=2.0, region_filter=abstract_region)
 
     rest(net, config)
-    n_pruned, ema_r = sleep(net, config, ema_r, rng, episodic=episodic)
+
+    # Structural maintenance: identical to infancy's nursery_exposure.
+    # Single-pass sleep_selective + single prune_competitive.
+    # Hyperparams control intensity; mechanism stays the same.
+    sleep_selective(net, downscale=config.sleep_downscale,
+                    tag_threshold=config.sleep_tag_threshold)
+    n_pruned = prune_competitive(
+        net, weak_threshold=config.prune_weak_threshold,
+        removal_rate=config.prune_removal_rate, rng=rng,
+    )
+
+    ema_r = homeostatic_excitability_update(
+        net, eta_b=config.eta_b, a_target=config.a_target, ema_r=ema_r,
+    )
 
     mean_reward = float(np.mean([a.reward for a in attempts]))
     return DayResult(
@@ -804,11 +826,14 @@ def sleep(
     has_memories = (episodic is not None and len(episodic.episodes) > 0
                     and config.replay_eta > 0)
 
-    # Per-cycle downscale: total effect across all cycles equals
-    # the original single-shot downscale.
-    # downscale^1 = per_cycle^n_cycles  =>  per_cycle = downscale^(1/n_cycles)
+    # Per-cycle parameters: total effect across all cycles equals
+    # the single-shot config value. Same approach for downscale,
+    # consolidation decay, and pruning removal rate.
+    # downscale^1 = per_cycle^n  =>  per_cycle = downscale^(1/n)
+    # survival: (1-r_total) = (1-r_per)^n  =>  r_per = 1-(1-r_total)^(1/n)
     per_cycle_downscale = config.sleep_downscale ** (1.0 / n_cycles)
     per_cycle_consolidation = config.consolidation_decay ** (1.0 / n_cycles)
+    per_cycle_removal = 1.0 - (1.0 - config.prune_removal_rate) ** (1.0 / n_cycles)
 
     total_pruned = 0
 
@@ -820,7 +845,8 @@ def sleep(
         sleep_selective(net, downscale=per_cycle_downscale,
                         tag_threshold=config.sleep_tag_threshold)
         n_pruned = prune_competitive(
-            net, weak_threshold=config.prune_weak_threshold, rng=rng,
+            net, weak_threshold=config.prune_weak_threshold,
+            removal_rate=per_cycle_removal, rng=rng,
         )
         total_pruned += n_pruned
 
@@ -955,12 +981,12 @@ def solve_task(
         else:
             step(net, signal=test_signal, noise_std=config.noise_std * 0.5)
 
-        conf = _cell_confidence(net.r, motor_offset, output_h, output_w, mh, mw)
+        conf = _cell_confidence(net.V, motor_offset, output_h, output_w, mh, mw)
         all_decided = bool(np.all(conf > config.theta_conf))
         rate_change = np.max(np.abs(net.r - prev_r))
 
         if all_decided and rate_change < 0.01:
-            grid = signal_to_grid(net.r, output_h, output_w,
+            grid = signal_to_grid(net.V, output_h, output_w,
                                   node_offset=motor_offset, max_h=mh, max_w=mw)
             return ReadoutResult(
                 grid=grid, decided=True, steps_taken=s,
@@ -968,8 +994,8 @@ def solve_task(
             )
         prev_r = net.r.copy()
 
-    conf = _cell_confidence(net.r, motor_offset, output_h, output_w, mh, mw)
-    grid = signal_to_grid(net.r, output_h, output_w,
+    conf = _cell_confidence(net.V, motor_offset, output_h, output_w, mh, mw)
+    grid = signal_to_grid(net.V, output_h, output_w,
                           node_offset=motor_offset, max_h=mh, max_w=mw)
     return ReadoutResult(
         grid=grid, decided=False, steps_taken=config.t_max,

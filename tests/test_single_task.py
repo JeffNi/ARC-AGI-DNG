@@ -22,7 +22,6 @@ def make_config():
     return LifecycleConfig(
         observe_steps=40, think_steps=60, consolidation_steps=20,
         eta=0.05, w_max=2.5,
-        free_phase_steps=40, clamped_phase_steps=40,
         attempts_per_round=6, n_rounds=4, stuck_patience=2,
         noise_std=0.02, focus_strength=0.5,
         rest_steps=20, rest_noise_std=0.03,

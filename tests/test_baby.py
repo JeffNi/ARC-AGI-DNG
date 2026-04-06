@@ -62,7 +62,7 @@ def reset():
     net.reset_facilitation()
 
 def read_motor(h, w):
-    return signal_to_grid(net.r, h, w, node_offset=motor_offset,
+    return signal_to_grid(net.V, h, w, node_offset=motor_offset,
                           max_h=mh, max_w=mw)
 
 

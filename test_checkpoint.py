@@ -14,7 +14,6 @@ print(f'WTA: {net.wta_k_frac:.3f}')
 
 CONFIG = LifecycleConfig(
     observe_steps=30, think_steps=40,
-    free_phase_steps=40, clamped_phase_steps=40,
     eta=0.05, w_max=2.5, noise_std=0.02, focus_strength=0.5,
     attempts_per_round=3, n_rounds=1,
     rest_steps=15, rest_noise_std=0.03,

@@ -59,7 +59,7 @@ def evaluate(net, label=""):
 
         # Test input
         think(net, signal=grid_to_signal(test_in, 0, n), steps=120, noise_std=NOISE * 0.5)
-        pred = signal_to_grid(net.r, 3, 3, node_offset=motor_offset)
+        pred = signal_to_grid(net.V, 3, 3, node_offset=motor_offset)
         preds.append(pred.tolist())
 
         net.V[:], net.r[:], net.adaptation[:], net.prev_r[:] = bk
@@ -74,7 +74,7 @@ def evaluate(net, label=""):
     for inp, out in train_pairs:
         net.V[:] *= 0.2; net.r[:] *= 0.2; net.adaptation[:] *= 0.2
         think(net, signal=grid_to_signal(inp, 0, n), steps=100, noise_std=NOISE * 0.5)
-        p = signal_to_grid(net.r, 3, 3, node_offset=motor_offset)
+        p = signal_to_grid(net.V, 3, 3, node_offset=motor_offset)
         train_preds.append((inp[0].tolist(), out[0].tolist(), p[0].tolist()))
     net.V[:], net.r[:], net.adaptation[:], net.prev_r[:] = bk
 

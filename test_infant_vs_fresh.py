@@ -35,8 +35,6 @@ GENOME = Genome(
 CONFIG = LifecycleConfig(
     observe_steps=30,
     think_steps=40,
-    free_phase_steps=40,
-    clamped_phase_steps=40,
     eta=0.05,
     w_max=2.5,
     noise_std=0.02,
@@ -172,15 +170,21 @@ def main():
 
     fresh_results = evaluate_network(fresh, tasks, "FRESH UNTRAINED NETWORK")
 
-    # ── Network B: Day 90 infant ──
-    print("\nLoading day 90 infant checkpoint...")
-    infant = DNG.load('models/infancy_checkpoints/day_0090.net.npz')
-    # Set adult-like parameters for task solving
+    # ── Network B: latest infant checkpoint ──
+    import glob as _glob
+    cp_files = sorted(_glob.glob('models/infancy_checkpoints/day_*.net.npz'))
+    if not cp_files:
+        print("No infancy checkpoints found!")
+        return
+    cp_path = cp_files[-1]
+    day_label = cp_path.split('day_')[1].split('.')[0]
+    print(f"\nLoading infant checkpoint: {cp_path}")
+    infant = DNG.load(cp_path)
     infant.wta_k_frac = 0.05
-    infant.inh_scale = 1.0  # adult E/I balance for task solving
-    infant.ach = 1.0  # learning mode for CHL
+    infant.inh_scale = 1.0
+    infant.ach = 1.0
 
-    infant_results = evaluate_network(infant, tasks, "DAY 90 INFANT NETWORK")
+    infant_results = evaluate_network(infant, tasks, f"DAY {day_label} INFANT NETWORK")
 
     # ── Summary ──
     print(f"\n{'='*60}")

@@ -62,7 +62,7 @@ def grid_to_signal(
 
 
 def signal_to_grid(
-    rates: np.ndarray,
+    values: np.ndarray,
     h: int,
     w: int,
     node_offset: int = 0,
@@ -70,7 +70,11 @@ def signal_to_grid(
     max_w: int | None = None,
 ) -> np.ndarray:
     """
-    Decode firing rates to an ARC grid via argmax (vectorized).
+    Decode motor neuron values to an ARC grid via argmax (vectorized).
+
+    *values* can be firing rates (r) or membrane voltages (V).  The
+    accumulation model uses V so that the decision reflects total
+    integrated evidence rather than saturated rates.
 
     If max_h/max_w are provided, decodes the full padded grid and then
     crops to the requested (h, w).
@@ -79,7 +83,7 @@ def signal_to_grid(
     decode_w = max_w if max_w is not None else w
     n_cells = decode_h * decode_w
 
-    motor_r = rates[node_offset : node_offset + n_cells * NUM_COLORS]
+    motor_r = values[node_offset : node_offset + n_cells * NUM_COLORS]
     motor_r = motor_r.reshape(n_cells, NUM_COLORS)
     full_grid = np.argmax(motor_r, axis=1).reshape(decode_h, decode_w).astype(int)
 

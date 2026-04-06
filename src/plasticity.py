@@ -109,8 +109,9 @@ def contrastive_hebbian_update(
     neg_mask = w < 0
 
     new_w = w + dw
-    new_w[pos_mask] = np.clip(new_w[pos_mask], 0.0, w_max)
-    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, 0.0)
+    _EPS = 1e-6
+    new_w[pos_mask] = np.clip(new_w[pos_mask], _EPS, w_max)
+    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, -_EPS)
 
     change = np.abs(new_w - w)
     net._edge_w[:n] = new_w
@@ -202,8 +203,9 @@ def prediction_error_update(
     neg_mask = w < 0
 
     new_w = w + dw
-    new_w[pos_mask] = np.clip(new_w[pos_mask], 0.0, w_max)
-    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, 0.0)
+    _EPS = 1e-6
+    new_w[pos_mask] = np.clip(new_w[pos_mask], _EPS, w_max)
+    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, -_EPS)
 
     net._edge_w[:n] = new_w
     net._edge_tag[:n] += np.abs(new_w - w)
@@ -240,81 +242,194 @@ def fast_hebbian_bind(
     _abstract = _region_list.index(Region.ABSTRACT)
     _motor = _region_list.index(Region.MOTOR)
     _memory = _region_list.index(Region.MEMORY)
+    _sensory = _region_list.index(Region.SENSORY)
 
     src = net._edge_src[:n]
     dst = net._edge_dst[:n]
-    src_reg = net.regions[src]
-    dst_reg = net.regions[dst]
 
-    # Eligible: abstract->abstract, abstract->motor, memory->abstract, memory->motor
-    src_ok = (src_reg == _abstract) | (src_reg == _memory)
-    dst_ok = (dst_reg == _abstract) | (dst_reg == _motor)
-    eligible = src_ok & dst_ok
+    # Fast pre-filter: only edges where BOTH endpoints are active.
+    # Typically <5% of 3.9M edges, so this avoids computing region
+    # masks and BCM on millions of irrelevant edges.
+    src_r = net.r[src]
+    dst_r = net.r[dst]
+    both_active = (src_r > activity_threshold) & (dst_r > activity_threshold)
+    active_idx = np.flatnonzero(both_active)
 
-    src_active = net.r[src] > activity_threshold
-    dst_active = net.r[dst] > activity_threshold
-    active = src_active & dst_active & eligible
-
-    n_active = int(active.sum())
-    if n_active == 0:
+    if len(active_idx) == 0:
         return 0
 
-    pre = net.r[src]
-    post = net.r[dst]
+    # Region eligibility on the small active subset only
+    a_src = src[active_idx]
+    a_dst = dst[active_idx]
+    a_src_reg = net.regions[a_src]
+    a_dst_reg = net.regions[a_dst]
 
-    # BCM-style sliding threshold: very active neurons raise their
-    # potentiation threshold, making it harder to strengthen their inputs
-    # further. Less active neurons lower it, making potentiation easier.
-    # This self-corrects the rich-get-richer problem.
-    bcm_theta = net.adaptation[dst] * 10.0
-    bcm_mod = post - bcm_theta  # positive = potentiate, negative = depress
-    dw_raw = eta * pre * np.maximum(bcm_mod, 0.0)
+    src_ok = (a_src_reg == _abstract) | (a_src_reg == _memory)
+    dst_ok = (a_dst_reg == _abstract) | (a_dst_reg == _motor)
+    copy_path = (a_src_reg == _sensory) & (a_dst_reg == _motor)
+    eligible = (src_ok & dst_ok) | copy_path
 
-    w = net._edge_w[:n].copy()
-    dw = np.where(active, dw_raw, 0.0)
-    inhib_src = net.node_types[src] == _NTYPE_I
-    dw[inhib_src & active] *= -1.0
+    if not eligible.any():
+        return 0
 
-    new_w = w + dw
-    pos = w > 0
-    neg = w < 0
-    new_w[pos] = np.clip(new_w[pos], 0.0, w_max)
-    new_w[neg] = np.clip(new_w[neg], -w_max, 0.0)
+    # Narrow to eligible-and-active edges
+    elig_idx = active_idx[eligible]
+    n_active = len(elig_idx)
 
-    # ── Heterosynaptic LTD: redistribute, don't just add ──────────
-    # For each postsynaptic neuron that gained weight, proportionally
-    # weaken its OTHER excitatory inputs. Total input stays roughly
-    # constant, but active pathways capture a larger share.
-    # Sensory (thalamocortical) edges are exempt -- biology maintains
-    # these via a separate mechanism to preserve input drive.
-    from .graph import Region
-    _sensory_idx = list(Region).index(Region.SENSORY)
-    from_sensory = net.regions[src] == _sensory_idx
+    e_src = src[elig_idx]
+    e_dst = dst[elig_idx]
+    pre = net.r[e_src]
+    post = net.r[e_dst]
 
-    total_gained = np.bincount(dst, weights=np.maximum(dw, 0.0),
+    # BCM-style sliding threshold
+    bcm_theta = net.adaptation[e_dst] * 10.0
+    bcm_mod = post - bcm_theta
+    dw = eta * pre * np.maximum(bcm_mod, 0.0)
+
+    inhib_src = net.node_types[e_src] == _NTYPE_I
+    dw[inhib_src] *= -1.0
+
+    w_old = net._edge_w[elig_idx]
+    new_w = w_old + dw
+    pos = w_old > 0
+    neg = w_old < 0
+    _EPS = 1e-6
+    new_w[pos] = np.clip(new_w[pos], _EPS, w_max)
+    new_w[neg] = np.clip(new_w[neg], -w_max, -_EPS)
+
+    # Heterosynaptic LTD: redistribute among non-potentiated excitatory inputs
+    gained = np.maximum(dw, 0.0)
+    total_gained = np.bincount(e_dst, weights=gained,
                                minlength=net.n_nodes)
-    neurons_with_gain = total_gained > 0
-    if neurons_with_gain.any():
-        # non-potentiated, non-sensory excitatory edges
-        exc_edges = (w > 0) & (~active) & (~from_sensory)
-        dst_gains = total_gained[dst]
-        n_exc_per = np.bincount(dst[exc_edges], minlength=net.n_nodes)
-        n_exc_at_dst = np.maximum(n_exc_per[dst], 1).astype(np.float64)
-        hetero_ltd = np.where(
-            exc_edges & (dst_gains > 0),
-            dst_gains / n_exc_at_dst * 0.5,
-            0.0,
-        )
-        new_w -= hetero_ltd
-        SILENT_FLOOR = 1e-4
-        new_w[pos] = np.maximum(new_w[pos], SILENT_FLOOR)
+    neurons_with_gain = np.flatnonzero(total_gained > 0)
+    if len(neurons_with_gain) > 0:
+        gain_set = np.zeros(net.n_nodes, dtype=bool)
+        gain_set[neurons_with_gain] = True
 
-    change = np.abs(new_w - w)
-    net._edge_w[:n] = new_w
-    net._edge_tag[:n] += change
+        # Build exact potentiated mask: only the edges we actually changed
+        potentiated = np.zeros(n, dtype=bool)
+        potentiated[elig_idx] = True
+
+        from_sensory = net.regions[src] == _sensory
+        w_all = net._edge_w[:n]
+        ltd_mask = (w_all > 0) & (~potentiated) & (~from_sensory) & gain_set[dst]
+        ltd_idx = np.flatnonzero(ltd_mask)
+        if len(ltd_idx) > 0:
+            ltd_dst = dst[ltd_idx]
+            dst_gains = total_gained[ltd_dst]
+            n_exc_per = np.bincount(ltd_dst, minlength=net.n_nodes)
+            n_exc_at = np.maximum(n_exc_per[ltd_dst], 1).astype(np.float64)
+            hetero_ltd = dst_gains / n_exc_at * 0.5
+            net._edge_w[ltd_idx] = np.maximum(
+                net._edge_w[ltd_idx] - hetero_ltd, 1e-4,
+            )
+
+    change = np.abs(new_w - w_old)
+    net._edge_w[elig_idx] = new_w
+    net._edge_tag[elig_idx] += change
     net._csr_dirty = True
 
     return n_active
+
+
+# ── Error-corrective three-factor learning (cerebellar model) ──────
+
+def error_corrective_update(
+    net: DNG,
+    r_guess: np.ndarray,
+    r_corrected: np.ndarray,
+    eta: float = 0.02,
+    w_max: float = 2.5,
+    activity_threshold: float = 0.02,
+) -> int:
+    """
+    Three-factor learning: adjust weights using pre activity, post error,
+    and dopamine modulation.
+
+    Biological basis: cerebellar climbing-fiber model. The signed error
+    at motor neurons propagates backward through existing feedback
+    connections. At each synapse, the weight update is:
+
+        dw = eta * pre * delta_post * DA
+
+    where delta_post = r_corrected[dst] - r_guess[dst] captures how much
+    the error signal shifted post-synaptic activity. Credit assignment
+    emerges naturally: only synapses whose post-synaptic neuron was
+    reached by the error signal get modified.
+
+    Returns number of edges modified.
+    """
+    n = net._edge_count
+    if n == 0:
+        return 0
+
+    from .graph import Region
+    _region_list = list(Region)
+    _abstract = _region_list.index(Region.ABSTRACT)
+    _motor = _region_list.index(Region.MOTOR)
+    _memory = _region_list.index(Region.MEMORY)
+    _sensory = _region_list.index(Region.SENSORY)
+
+    src = net._edge_src[:n]
+    dst = net._edge_dst[:n]
+
+    delta_r = r_corrected - r_guess
+
+    # Pre-filter: pre was active during the guess AND post was meaningfully
+    # shifted by the error signal. Both conditions needed for three-factor.
+    pre_active = r_guess[src] > activity_threshold
+    post_shifted = np.abs(delta_r[dst]) > activity_threshold * 0.5
+    candidate = pre_active & post_shifted
+    cand_idx = np.flatnonzero(candidate)
+
+    if len(cand_idx) == 0:
+        return 0
+
+    # Region eligibility (same as Hebbian binding)
+    c_src = src[cand_idx]
+    c_dst = dst[cand_idx]
+    c_src_reg = net.regions[c_src]
+    c_dst_reg = net.regions[c_dst]
+
+    src_ok = (c_src_reg == _abstract) | (c_src_reg == _memory)
+    dst_ok = (c_dst_reg == _abstract) | (c_dst_reg == _motor)
+    copy_path = (c_src_reg == _sensory) & (c_dst_reg == _motor)
+    eligible = (src_ok & dst_ok) | copy_path
+
+    if not eligible.any():
+        return 0
+
+    elig_idx = cand_idx[eligible]
+
+    e_src = src[elig_idx]
+    e_dst = dst[elig_idx]
+    pre = r_guess[e_src]
+    delta_post = delta_r[e_dst]
+
+    # Three-factor: pre * error * DA
+    da_mod = max(net.da, 0.1)
+    dw = eta * pre * delta_post * da_mod
+
+    # Dale's law: inhibitory sources produce sign-flipped updates
+    inhib_src = net.node_types[e_src] == _NTYPE_I
+    dw[inhib_src] *= -1.0
+
+    w_old = net._edge_w[elig_idx]
+    new_w = w_old + dw
+    pos = w_old > 0
+    neg = w_old < 0
+    # Use small epsilon floor to prevent zeroing edges — compact() sweeps
+    # all zero-weight edges, which would silently destroy the network.
+    _EPS = 1e-6
+    new_w[pos] = np.clip(new_w[pos], _EPS, w_max)
+    new_w[neg] = np.clip(new_w[neg], -w_max, -_EPS)
+
+    change = np.abs(new_w - w_old)
+    net._edge_w[elig_idx] = new_w
+    net._edge_tag[elig_idx] += change
+    net._csr_dirty = True
+
+    return int(np.sum(change > 1e-10))
 
 
 # ── Synaptic scaling (homeostatic weight normalization) ────────────

@@ -50,8 +50,6 @@ parser.add_argument("--checkpoint-every", type=int, default=10,
                     help="Save checkpoint every N days (default: 10)")
 parser.add_argument("--seed", type=int, default=42,
                     help="Random seed (default: 42)")
-parser.add_argument("--tag", type=str, default=None,
-                    help="Checkpoint subdirectory tag (e.g. 'v2')")
 args = parser.parse_args()
 
 # ── Constants ─────────────────────────────────────────────────────
@@ -60,8 +58,7 @@ MAX_H = MAX_W = 10
 N_INFANCY_DAYS = args.days
 GRIDS_PER_DAY = args.grids_per_day
 CHECKPOINT_EVERY = args.checkpoint_every
-_ckpt_name = f"infancy_{args.tag}" if args.tag else "infancy_checkpoints"
-CHECKPOINT_DIR = os.path.join("models", _ckpt_name)
+CHECKPOINT_DIR = os.path.join("models", "infancy_checkpoints")
 N_TASK_TEST = 12
 
 # ── Scaled-up genome ─────────────────────────────────────────────
@@ -75,8 +72,6 @@ GENOME = Genome(
 CONFIG = LifecycleConfig(
     observe_steps=30,
     think_steps=40,
-    free_phase_steps=40,
-    clamped_phase_steps=40,
     eta=0.05,
     w_max=2.5,
     noise_std=0.02,

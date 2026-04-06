@@ -64,7 +64,6 @@ print(f"  {net.n_nodes} nodes, {net.edge_count()} edges "
 config = LifecycleConfig(
     observe_steps=30, think_steps=50, consolidation_steps=15,
     eta=0.15, w_max=2.5,
-    free_phase_steps=30, clamped_phase_steps=30,
     attempts_per_round=3, n_rounds=3, stuck_patience=2,
     noise_std=0.02, focus_strength=0.5,
 )
