@@ -35,11 +35,13 @@ class NodeType(enum.Enum):
 
 class Region(enum.Enum):
     SENSORY = "sensory"
+    INTERNAL = "internal"
+    MOTOR = "motor"
+    MEMORY = "memory"
+    # Phase 2 regions (kept for future use)
     LOCAL_DETECT = "local_detect"
     MID_LEVEL = "mid_level"
     ABSTRACT = "abstract"
-    MOTOR = "motor"
-    MEMORY = "memory"
 
 
 _NTYPE_LIST = list(NodeType)
@@ -75,12 +77,12 @@ class DNG:
     # Per-node state
     V: np.ndarray = None
     threshold: np.ndarray = None
-    max_rate: float = 1.0
 
-    # Per-node parameters
+    # Per-node parameters (arrays, not scalars — different neuron types differ)
+    max_rate: np.ndarray = None
     excitability: np.ndarray = None
     leak_rates: np.ndarray = None
-    adapt_rate: float = 0.01
+    adapt_rate: np.ndarray = None
     adapt_decay: float = 0.1
 
     # Derived (computed from V each step)
@@ -100,6 +102,10 @@ class DNG:
     ach: float = 1.0          # acetylcholine: learning mode (1=childhood, 0=adult)
     ne: float = 0.0           # norepinephrine: surprise/arousal
 
+    # E/I balance (developmental)
+    inh_scale: float = 1.0    # multiplier for inhibitory (negative) weights
+    _last_inh_scale: float = field(default=1.0, repr=False)
+
     # Node groups
     input_nodes: np.ndarray = None
     output_nodes: np.ndarray = None
@@ -111,6 +117,7 @@ class DNG:
     _edge_w: np.ndarray = field(default=None, repr=False)
     _edge_tag: np.ndarray = field(default=None, repr=False)
     _edge_weak_count: np.ndarray = field(default=None, repr=False)
+    _edge_eligibility: np.ndarray = field(default=None, repr=False)
     _edge_count: int = field(default=0, repr=False)
     _edge_capacity: int = field(default=0, repr=False)
 
@@ -132,37 +139,47 @@ class DNG:
     _mask_E: np.ndarray = field(default=None, repr=False)
 
     def __post_init__(self):
+        n = self.n_nodes
         if self.V is None:
-            self.V = np.zeros(self.n_nodes)
+            self.V = np.zeros(n)
         if self.threshold is None:
-            self.threshold = np.full(self.n_nodes, 0.1)
+            self.threshold = np.full(n, 0.1)
+        if self.max_rate is None:
+            self.max_rate = np.ones(n)
+        if self.adapt_rate is None:
+            self.adapt_rate = np.full(n, 0.01)
         if self.excitability is None:
-            self.excitability = np.ones(self.n_nodes)
+            self.excitability = np.ones(n)
         if self.leak_rates is None:
-            self.leak_rates = np.full(self.n_nodes, 0.3)
+            self.leak_rates = np.full(n, 0.3)
         if self.r is None:
-            self.r = np.zeros(self.n_nodes)
+            self.r = np.zeros(n)
         if self.prev_r is None:
-            self.prev_r = np.zeros(self.n_nodes)
+            self.prev_r = np.zeros(n)
         if self.adaptation is None:
-            self.adaptation = np.zeros(self.n_nodes)
+            self.adaptation = np.zeros(n)
         if self.f is None:
-            self.f = np.zeros(self.n_nodes)
+            self.f = np.zeros(n)
         if self.column_ids is None:
-            self.column_ids = np.full(self.n_nodes, -1, dtype=np.int32)
+            self.column_ids = np.full(n, -1, dtype=np.int32)
         if self.memory_nodes is None:
             self.memory_nodes = np.array([], dtype=np.int32)
 
         if self._edge_src is None:
-            cap = max(1000, self.n_nodes * 10)
+            cap = max(1000, n * 10)
             self._edge_src = np.empty(cap, dtype=np.int32)
             self._edge_dst = np.empty(cap, dtype=np.int32)
             self._edge_w = np.empty(cap, dtype=np.float64)
             self._edge_tag = np.zeros(cap, dtype=np.float64)
             self._edge_weak_count = np.zeros(cap, dtype=np.int32)
             self._edge_consolidation = np.zeros(cap, dtype=np.float64)
+            self._edge_eligibility = np.zeros(cap, dtype=np.float64)
             self._edge_count = 0
             self._edge_capacity = cap
+
+        # Ensure eligibility array exists (for networks loaded from old checkpoints)
+        if self._edge_eligibility is None:
+            self._edge_eligibility = np.zeros(self._edge_capacity, dtype=np.float64)
 
         self._build_type_masks()
 
@@ -171,7 +188,8 @@ class DNG:
         self._mask_E = ~self._mask_I
 
     def compute_rates(self):
-        self.r = np.clip(self.V - self.threshold, 0.0, self.max_rate)
+        self.r = np.clip(self.V - self.threshold, 0.0, None)
+        np.minimum(self.r, self.max_rate, out=self.r)
 
     def reset_facilitation(self):
         """Reset short-term facilitation (between tasks)."""
@@ -191,15 +209,14 @@ class DNG:
             self._edge_src = np.resize(self._edge_src, new_cap)
             self._edge_dst = np.resize(self._edge_dst, new_cap)
             self._edge_w = np.resize(self._edge_w, new_cap)
-            old_tag = self._edge_tag
-            self._edge_tag = np.zeros(new_cap, dtype=np.float64)
-            self._edge_tag[:len(old_tag)] = old_tag
+            for attr in ('_edge_tag', '_edge_consolidation', '_edge_eligibility'):
+                old = getattr(self, attr)
+                new = np.zeros(new_cap, dtype=np.float64)
+                new[:len(old)] = old
+                setattr(self, attr, new)
             old_wc = self._edge_weak_count
             self._edge_weak_count = np.zeros(new_cap, dtype=np.int32)
             self._edge_weak_count[:len(old_wc)] = old_wc
-            old_cons = self._edge_consolidation
-            self._edge_consolidation = np.zeros(new_cap, dtype=np.float64)
-            self._edge_consolidation[:len(old_cons)] = old_cons
             self._edge_capacity = new_cap
 
     def add_edge(self, src: int, dst: int, weight: float):
@@ -225,6 +242,7 @@ class DNG:
         self._edge_w[start:start + n_new] = weights
         self._edge_tag[start:start + n_new] = 0.0
         self._edge_weak_count[start:start + n_new] = 0
+        self._edge_eligibility[start:start + n_new] = 0.0
         self._edge_count += n_new
         self._csr_dirty = True
 
@@ -237,15 +255,41 @@ class DNG:
         return self._edge_count
 
     def get_weight_matrix(self) -> sparse.csr_matrix:
-        """CSR weight matrix W where W[dst, src] = weight."""
-        if self._csr_dirty or self._W_csr is None:
+        """CSR weight matrix W where W[dst, src] = weight.
+
+        Applies inh_scale to inhibitory (negative) weights so the stored
+        edge weights remain at their base values while the matrix used
+        for dynamics reflects the current developmental E/I balance.
+        """
+        scale_changed = self._last_inh_scale != self.inh_scale
+        if self._csr_dirty or self._W_csr is None or scale_changed:
             n = self._edge_count
+            w = self._edge_w[:n]
+            if self.inh_scale != 1.0:
+                w = w.copy()
+                neg = w < 0
+                w[neg] *= self.inh_scale
             self._W_csr = sparse.csr_matrix(
-                (self._edge_w[:n], (self._edge_dst[:n], self._edge_src[:n])),
+                (w, (self._edge_dst[:n], self._edge_src[:n])),
                 shape=(self.n_nodes, self.n_nodes),
             )
             self._csr_dirty = False
+            self._last_inh_scale = self.inh_scale
         return self._W_csr
+
+    def get_csr_permutation(self) -> np.ndarray:
+        """Return array mapping edge index -> CSR data position.
+
+        Needed by the GPU plastic kernel to sync CSR data after
+        modifying edge weights.  The permutation is the sort order
+        that scipy uses when building CSR from COO: lexsort by (row, col)
+        = (dst, src).
+        """
+        n = self._edge_count
+        return np.lexsort((
+            self._edge_src[:n].astype(np.int64),
+            self._edge_dst[:n].astype(np.int64),
+        ))
 
     def compact(self):
         """Remove deleted edges (weight==0 markers)."""
@@ -257,6 +301,8 @@ class DNG:
         self._edge_w[:alive] = self._edge_w[:n][mask]
         self._edge_tag[:alive] = self._edge_tag[:n][mask]
         self._edge_weak_count[:alive] = self._edge_weak_count[:n][mask]
+        self._edge_eligibility[:alive] = self._edge_eligibility[:n][mask]
+        self._edge_consolidation[:alive] = self._edge_consolidation[:n][mask]
         self._edge_count = alive
         self._csr_dirty = True
 
@@ -269,11 +315,11 @@ class DNG:
             regions=self.regions,
             V=self.V,
             threshold=self.threshold,
-            max_rate=np.array([self.max_rate]),
+            max_rate=self.max_rate,
             excitability=self.excitability,
             leak_rates=self.leak_rates,
             adaptation=self.adaptation,
-            adapt_rate=np.array([self.adapt_rate]),
+            adapt_rate=self.adapt_rate,
             adapt_decay=np.array([self.adapt_decay]),
             f=self.f,
             f_rate=np.array([self.f_rate]),
@@ -287,6 +333,8 @@ class DNG:
             edges_w=self._edge_w[:n].copy(),
             edges_tag=self._edge_tag[:n].copy(),
             edges_weak_count=self._edge_weak_count[:n].copy(),
+            edges_eligibility=self._edge_eligibility[:n].copy(),
+            edges_consolidation=self._edge_consolidation[:n].copy(),
             column_ids=self.column_ids,
             n_columns=np.array([self.n_columns]),
             wta_k_frac=np.array([self.wta_k_frac]),
@@ -296,6 +344,7 @@ class DNG:
             da_baseline=np.array([self.da_baseline]),
             ach=np.array([self.ach]),
             ne=np.array([self.ne]),
+            inh_scale=np.array([self.inh_scale]),
         )
 
     @classmethod
@@ -305,10 +354,11 @@ class DNG:
         dst = data["edges_dst"]
         w = data["edges_w"]
         n_edges = len(src)
+        n_nodes = int(data["n_nodes"][0])
         cap = max(n_edges * 2, 1000)
 
         net = cls(
-            n_nodes=int(data["n_nodes"][0]),
+            n_nodes=n_nodes,
             node_types=data["node_types"],
             regions=data["regions"],
             excitability=data["excitability"],
@@ -318,10 +368,24 @@ class DNG:
         )
         net.V = data["V"]
         net.threshold = data["threshold"]
-        net.max_rate = float(data["max_rate"][0])
+
+        # Per-node arrays: handle both old (scalar) and new (array) formats
+        mr = data["max_rate"]
+        if mr.ndim == 0 or len(mr) == 1:
+            net.max_rate = np.full(n_nodes, float(mr.flat[0]))
+        else:
+            net.max_rate = mr.copy()
+
         net.adaptation = data["adaptation"]
-        net.adapt_rate = float(data["adapt_rate"][0])
-        net.adapt_decay = float(data["adapt_decay"][0])
+
+        ar = data["adapt_rate"]
+        if ar.ndim == 0 or len(ar) == 1:
+            net.adapt_rate = np.full(n_nodes, float(ar.flat[0]))
+        else:
+            net.adapt_rate = ar.copy()
+
+        net.adapt_decay = float(data["adapt_decay"].flat[0])
+
         if "f" in data:
             net.f = data["f"]
             net.f_rate = float(data["f_rate"][0])
@@ -341,11 +405,16 @@ class DNG:
             net.da_baseline = float(data["da_baseline"][0])
             net.ach = float(data["ach"][0])
             net.ne = float(data["ne"][0])
+        if "inh_scale" in data:
+            net.inh_scale = float(data["inh_scale"][0])
+
         net._edge_src = np.empty(cap, dtype=np.int32)
         net._edge_dst = np.empty(cap, dtype=np.int32)
         net._edge_w = np.empty(cap, dtype=np.float64)
         net._edge_tag = np.zeros(cap, dtype=np.float64)
         net._edge_weak_count = np.zeros(cap, dtype=np.int32)
+        net._edge_eligibility = np.zeros(cap, dtype=np.float64)
+        net._edge_consolidation = np.zeros(cap, dtype=np.float64)
         net._edge_src[:n_edges] = src
         net._edge_dst[:n_edges] = dst
         net._edge_w[:n_edges] = w
@@ -353,6 +422,10 @@ class DNG:
             net._edge_tag[:n_edges] = data["edges_tag"]
         if "edges_weak_count" in data:
             net._edge_weak_count[:n_edges] = data["edges_weak_count"]
+        if "edges_eligibility" in data:
+            net._edge_eligibility[:n_edges] = data["edges_eligibility"]
+        if "edges_consolidation" in data:
+            net._edge_consolidation[:n_edges] = data["edges_consolidation"]
         net._edge_count = n_edges
         net._edge_capacity = cap
         net._csr_dirty = True

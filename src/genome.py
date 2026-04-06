@@ -46,7 +46,7 @@ class Genome:
     max_fan_in: int = 150
 
     # ── Weight initialization ─────────────────────────────────────────
-    weight_scale: float = 0.01
+    weight_scale: float = 0.002
 
     # ── Facilitation parameters ───────────────────────────────────────
     f_rate: float = 0.05
@@ -65,6 +65,36 @@ class Genome:
     learn_steps: int = 30
     rest_steps: int = 30
     rest_noise_std: float = 0.05
+
+    # ── Dynamics / WTA ───────────────────────────────────────────────
+    noise_std: float = 0.01
+    plasticity_interval: int = 5
+    wta_k: int = 20
+
+    # ── Homeostasis ───────────────────────────────────────────────────
+    homeostasis_interval: int = 50
+
+    # ── CHL / eligibility / DA parameters (Phase 1) ───────────────────
+    chl_eta: float = 0.01
+    elig_eta: float = 0.2
+    elig_decay: float = 0.85
+
+    # ── DA parameters ──────────────────────────────────────────────────
+    da_baseline_obs: float = 0.2
+    da_baseline_attempt: float = 0.0
+    da_baseline_rest: float = 0.05
+    da_decay: float = 0.05
+
+    # ── Fatigue / sleep ────────────────────────────────────────────────
+    fatigue_rate: float = 0.05
+    fatigue_threshold: float = 10.0
+    fatigue_sleep_reset: float = 0.1
+
+    # ── Per-node type defaults ─────────────────────────────────────────
+    max_rate_E: float = 1.0
+    max_rate_I: float = 1.5
+    adapt_rate_E: float = 0.01
+    adapt_rate_I: float = 0.005
 
     def mutate(self, rng: np.random.Generator, strength: float = 0.1) -> "Genome":
         """Create a mutated copy of this genome."""

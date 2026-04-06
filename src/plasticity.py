@@ -1,25 +1,15 @@
 """
 Synaptic and structural plasticity.
 
-Learning rules operate on firing rates (r >= 0).
+Phase 1 learning rules:
+  - Contrastive Hebbian Learning (CHL): error-corrective
+  - Eligibility-modulated update: DA cashes in tagged synapses
+  - Consolidation: protects well-learned synapses
+  - Structural: synaptogenesis + pruning
+  - Homeostatic excitability
+
 Dale's law maintained: weight updates preserve each edge's sign.
-
-Primary rule: Contrastive Hebbian Learning (CHL).
-  Free phase:    network thinks with test input, records correlations.
-  Clamped phase: correct output injected on motor nodes, records correlations.
-  Update:        dw = eta * DA * ACh * (clamped_corr - free_corr)
-
-  Biologically: the difference between "what I thought" and
-  "what I see when shown the answer" drives synaptic change.
-  Dopamine modulates magnitude (reward prediction error).
-  Acetylcholine gates plasticity (high in childhood, low in adult).
-
-Structural plasticity:
-  Synaptogenesis: co-active unconnected nodes grow new edges.
-  Pruning: sustained weak edges are removed.
-  Both happen at every developmental phase, at different rates.
-
-Also: homeostatic excitability, selective sleep.
+ALL edges are plastic (no region-based exclusions — past failure).
 """
 
 from __future__ import annotations
@@ -38,10 +28,7 @@ def record_phase(
     steps: int,
     noise_std: float,
 ) -> np.ndarray:
-    """
-    Run network for N steps, accumulate average pre*post correlations.
-    Delegates to the Numba-compiled record_think for speed.
-    """
+    """Run network for N steps, accumulate average pre*post correlations."""
     from .dynamics import record_think
     return record_think(net, signal=signal, steps=steps, noise_std=noise_std)
 
@@ -56,31 +43,25 @@ def contrastive_hebbian_update(
     w_max: float = 2.0,
 ) -> float:
     """
-    Update weights using the difference in correlations between
-    clamped (correct answer shown) and free (network's own guess) phases.
+    Update weights using correlation difference between clamped and free phases.
 
-    dw = eta * DA * ACh * (clamped_corr - free_corr)
+    dw = eta * DA * (clamped_corr - free_corr)
 
-    DA and ACh are read from net.da, net.ach.
-    Returns mean absolute weight change for monitoring.
+    DA can be negative, which REVERSES the update direction.
     """
     n = net._edge_count
     if n == 0:
         return 0.0
 
-    da = max(net.da, 0.0)
-    ach = net.ach
-
-    modulation = eta * da * ach
-    if modulation < 1e-8:
+    da = net.da
+    modulation = eta * da
+    if abs(modulation) < 1e-8:
         return 0.0
 
     diff = clamped_corr[:n] - free_corr[:n]
     dw = modulation * diff
 
-    # Synaptic consolidation: well-established synapses resist modification.
-    # plasticity_scale ∈ (0, 1]: fully plastic when consolidation=0,
-    # approaching 0 for highly consolidated synapses.
+    # Consolidation: well-established synapses resist modification
     cons = net._edge_consolidation[:n]
     if cons.any():
         plasticity_scale = 1.0 / (1.0 + cons)
@@ -102,6 +83,69 @@ def contrastive_hebbian_update(
     return float(np.mean(change))
 
 
+# ── Eligibility-modulated update ──────────────────────────────────
+
+def eligibility_modulated_update(
+    net: DNG,
+    DA: float,
+    eta: float = 0.02,
+    w_max: float = 5.0,
+) -> float:
+    """
+    Apply delayed reward signal to eligible synapses.
+
+    dw = eta * DA * eligibility * consolidation_scale
+
+    CRITICAL BEHAVIOR:
+    - Positive DA + positive eligibility -> strengthen (excitatory: increase, inhibitory: more negative)
+    - Negative DA + positive eligibility -> WEAKEN (excitatory: decrease, inhibitory: less negative)
+    - Zero eligibility -> no change regardless of DA
+
+    After update, eligibility traces are decayed (not zeroed — partial credit).
+    """
+    n = net._edge_count
+    if n == 0:
+        return 0.0
+
+    elig = net._edge_eligibility[:n]
+    if not np.any(elig > 1e-6):
+        return 0.0
+
+    # Base weight change: eta * DA * eligibility
+    dw = eta * DA * elig
+
+    # Consolidation protection
+    cons = net._edge_consolidation[:n]
+    if cons.any():
+        plasticity_scale = 1.0 / (1.0 + cons)
+        dw *= plasticity_scale
+
+    w = net._edge_w[:n]
+
+    # Dale's law: inhibitory edges flip dw so "strengthen" = more negative
+    neg_mask = w < 0
+    dw[neg_mask] = -dw[neg_mask]
+
+    new_w = w + dw
+
+    # Clip to maintain sign (Dale's law)
+    pos_mask = w > 0
+    new_w[pos_mask] = np.clip(new_w[pos_mask], 1e-6, w_max)
+    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, -1e-6)
+
+    change = np.abs(new_w - w)
+    net._edge_w[:n] = new_w
+    net._edge_tag[:n] += change
+    net._csr_dirty = True
+
+    # Decay eligibility after cashing in (partial, not zeroed)
+    net._edge_eligibility[:n] *= 0.5
+
+    return float(np.mean(change))
+
+
+# ── Consolidation ─────────────────────────────────────────────────
+
 def consolidate_synapses(
     net: DNG,
     w_before: np.ndarray,
@@ -112,13 +156,9 @@ def consolidate_synapses(
     """
     After successful learning, mark changed synapses as consolidated.
 
-    Biologically: LTP involves structural spine growth and AMPA receptor
-    insertion. Strongly modified synapses become physically larger and
-    more resistant to future depression -- metaplasticity.
-
-    Any synapse that changed gets consolidation += strength, making it
-    ~(1+strength)x less plastic. With strength=2.0, a consolidated
-    synapse has only 33% of normal plasticity.
+    Consolidated synapses have reduced plasticity: effective learning rate
+    is scaled by 1/(1+consolidation). With strength=2.0, a consolidated
+    synapse has ~33% of normal plasticity.
     """
     if reward < reward_threshold:
         return 0
@@ -133,65 +173,6 @@ def consolidate_synapses(
 def get_weight_snapshot(net: DNG) -> np.ndarray:
     """Save current edge weights for later consolidation comparison."""
     return net._edge_w[:net._edge_count].copy()
-
-
-# ── Prediction-error learning (legacy, kept for comparison) ───────
-
-def prediction_error_update(
-    net: DNG,
-    target_r: np.ndarray,
-    eta: float = 0.01,
-    w_max: float = 2.0,
-    error_propagation: float = 0.3,
-) -> float:
-    """2-hop prediction error from motor nodes. See previous docstring."""
-    n = net._edge_count
-    if n == 0:
-        return 0.0
-
-    src = net._edge_src[:n]
-    dst = net._edge_dst[:n]
-    w = net._edge_w[:n]
-
-    motor_nodes = net.output_nodes
-
-    error = np.zeros(net.n_nodes)
-    error[motor_nodes] = target_r[motor_nodes] - net.r[motor_nodes]
-    mean_err = float(np.mean(np.abs(error[motor_nodes])))
-
-    motor_mask = np.isin(dst, motor_nodes)
-    if np.any(motor_mask):
-        mi = np.where(motor_mask)[0]
-        np.add.at(error, src[mi],
-                  error_propagation * w[mi] * error[dst[mi]])
-
-    has_error = np.where(np.abs(error) > 0.001)[0]
-    if len(has_error) > 0:
-        error_mask = np.isin(dst, has_error) & ~motor_mask
-        if np.any(error_mask):
-            ei = np.where(error_mask)[0]
-            np.add.at(error, src[ei],
-                      error_propagation * 0.5 * w[ei] * error[dst[ei]])
-
-    pre_rate = net.r[src]
-    post_error = error[dst]
-    active = pre_rate > 0.01
-
-    dw = np.zeros(n)
-    dw[active] = eta * pre_rate[active] * post_error[active]
-
-    pos_mask = w > 0
-    neg_mask = w < 0
-
-    new_w = w + dw
-    new_w[pos_mask] = np.clip(new_w[pos_mask], 0.0, w_max)
-    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, 0.0)
-
-    net._edge_w[:n] = new_w
-    net._edge_tag[:n] += np.abs(new_w - w)
-    net._csr_dirty = True
-
-    return mean_err
 
 
 # ── Homeostatic plasticity ─────────────────────────────────────────
@@ -222,7 +203,7 @@ def sleep_selective(
     downscale: float = 0.95,
     tag_threshold: float = 0.01,
 ) -> None:
-    """Selective downscaling: only weaken untagged synapses."""
+    """Selective downscaling: only weaken untagged synapses (SHY hypothesis)."""
     n = net._edge_count
     if n == 0:
         return
@@ -262,25 +243,7 @@ def synaptogenesis(
     n_candidates: int = 5000,
     rng: np.random.Generator | None = None,
 ) -> int:
-    """
-    Grow new edges between co-active unconnected node pairs.
-
-    Probability-based, modulated by ACh (acetylcholine):
-      For each candidate pair (src, dst):
-        p = growth_rate * ACh * r[src] * r[dst]
-        if random() < p: create edge
-
-    This means:
-      - More co-active pairs → more connections (fire together, wire together)
-      - Higher ACh (childhood) → more growth
-      - Lower ACh (adult) → rare growth
-      - The NUMBER of new edges isn't hard-coded; it emerges from activity
-
-    New edge weight is proportional to co-activation strength.
-    Dale's law: excitatory source → positive weight, inhibitory → negative.
-
-    Returns number of edges created.
-    """
+    """Grow new edges between co-active unconnected node pairs."""
     if rng is None:
         rng = np.random.default_rng()
     if growth_rate <= 0 or net.ach < 0.01:
@@ -288,11 +251,8 @@ def synaptogenesis(
 
     from .graph import Region
     region_list = list(Region)
-    sensory_idx = region_list.index(Region.SENSORY)
     motor_idx = region_list.index(Region.MOTOR)
 
-    # Two pools: active nodes (co-activation driven) and all nodes (exploratory).
-    # High ACh (childhood) allows more exploratory connections.
     active_mask = net.r > 0.02
     active_idx = np.where(active_mask)[0]
     n_active = len(active_idx)
@@ -300,8 +260,7 @@ def synaptogenesis(
     if n_active < 2:
         return 0
 
-    # Split candidates: most from active nodes, some exploratory from ALL nodes
-    explore_frac = 0.2 * net.ach  # up to 20% exploratory during high-ACh
+    explore_frac = 0.2 * net.ach
     n_explore = int(n_candidates * explore_frac)
     n_coactive = n_candidates - n_explore
 
@@ -309,7 +268,6 @@ def synaptogenesis(
     src_active = active_idx[rng.integers(0, n_active, size=n_cand_active)]
     dst_active = active_idx[rng.integers(0, n_active, size=n_cand_active)]
 
-    # Exploratory: sample from ALL non-sensory/non-motor-source nodes
     all_idx = np.arange(net.n_nodes)
     src_explore = all_idx[rng.integers(0, net.n_nodes, size=n_explore)]
     dst_explore = all_idx[rng.integers(0, net.n_nodes, size=n_explore)]
@@ -317,10 +275,9 @@ def synaptogenesis(
     src_samples = np.concatenate([src_active, src_explore])
     dst_samples = np.concatenate([dst_active, dst_explore])
 
-    # Filter: no self-loops, no edges TO sensory, no edges FROM motor
+    # No self-loops, no edges FROM motor (motor is output only)
     valid = (
         (src_samples != dst_samples) &
-        (net.regions[dst_samples] != sensory_idx) &
         (net.regions[src_samples] != motor_idx)
     )
     src_samples = src_samples[valid]
@@ -329,7 +286,6 @@ def synaptogenesis(
     if len(src_samples) == 0:
         return 0
 
-    # Filter out existing edges using hash set (O(1) lookup per candidate)
     n_nodes = net.n_nodes
     n_existing = net._edge_count
     existing_set = set(
@@ -346,9 +302,8 @@ def synaptogenesis(
     if len(src_samples) == 0:
         return 0
 
-    # Probability: co-activation driven + tiny baseline for exploration
     coact = net.r[src_samples] * net.r[dst_samples]
-    baseline_p = 0.001 * net.ach  # very small chance without co-firing
+    baseline_p = 0.001 * net.ach
     prob = growth_rate * net.ach * coact + baseline_p
     np.clip(prob, 0.0, 1.0, out=prob)
     rolls = rng.random(len(prob))
@@ -360,8 +315,6 @@ def synaptogenesis(
     if len(new_src) == 0:
         return 0
 
-    # "Silent synapse" initial weights: structurally present but functionally
-    # very weak. They must be strengthened through CHL to become functional.
     new_coact = coact[winners]
     base_weight = 0.001 + 0.004 * (new_coact / (new_coact.max() + 1e-8))
     is_inhib = net.node_types[new_src] == _NTYPE_I

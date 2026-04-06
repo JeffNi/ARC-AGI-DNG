@@ -1,15 +1,15 @@
 """
 Template generator: genome -> DNG.
 
-Layout:
-  Sensory (max_h * max_w * 10)
-    -> Internal (n_internal)  <->  Concept (n_concept)
-    -> Memory (n_memory, self-sustaining, long-term)
-    -> Motor (max_h * max_w * 10)
+Phase 1 layout (Evolutionary Minimalism):
+  SENSORY (perception features: 28 per cell + 28 global)
+    -> INTERNAL (E/I neurons, main processing)
+    <-> MEMORY (self-sustaining, episodic)
+    -> MOTOR (10 colors per cell, one-hot)
 
 Instinct circuits:
-  - Copy pathway: sensory[cell,color] -> motor[cell,color] (identity mapping)
-  - Memory self-connections: bistable, once activated stays on
+  - Copy pathway: sensory color nodes -> motor color nodes (identity mapping)
+  - Memory self-connections: bistable attractor dynamics
   - Memory <-> internal: write and recall paths
 """
 
@@ -18,8 +18,9 @@ from __future__ import annotations
 import numpy as np
 
 from .encoding import NUM_COLORS
+from .perception.encoder import sensory_size, FEATURES_PER_CELL
 from .genome import Genome
-from .graph import DNG, NodeType, Region, DEFAULT_LEAK
+from .graph import DNG, NodeType, Region, DEFAULT_LEAK, _NTYPE_E, _NTYPE_I
 
 
 def create_dng(
@@ -32,63 +33,49 @@ def create_dng(
         rng = np.random.default_rng()
 
     n_cells = grid_h * grid_w
-    n_io = n_cells * NUM_COLORS
+    n_sensory = sensory_size(grid_h, grid_w)
+    n_motor = n_cells * NUM_COLORS
     n_int = genome.n_internal
-    n_concept = genome.n_concept
     n_mem = genome.n_memory
-    n_total = n_io + n_int + n_concept + n_mem + n_io
+    n_total = n_sensory + n_int + n_mem + n_motor
 
     sensory_start = 0
-    internal_start = n_io
-    concept_start = n_io + n_int
-    memory_start = n_io + n_int + n_concept
-    motor_start = n_io + n_int + n_concept + n_mem
+    internal_start = n_sensory
+    memory_start = n_sensory + n_int
+    motor_start = n_sensory + n_int + n_mem
 
-    sensory = np.arange(sensory_start, sensory_start + n_io)
+    sensory = np.arange(sensory_start, sensory_start + n_sensory)
     internal = np.arange(internal_start, internal_start + n_int)
-    concept = np.arange(concept_start, concept_start + n_concept)
     memory = np.arange(memory_start, memory_start + n_mem)
-    motor = np.arange(motor_start, motor_start + n_io)
+    motor = np.arange(motor_start, motor_start + n_motor)
 
-    # ── Node types ──────────────────────────────────────────────────
-    node_types = np.full(n_total, list(NodeType).index(NodeType.E), dtype=int)
-
+    # Node types: E/I split for internal only
+    node_types = np.full(n_total, _NTYPE_E, dtype=int)
     n_inhib = int(n_int * genome.frac_inhibitory)
-    n_modul = int(n_int * genome.frac_modulatory)
-    n_mem_internal = int(n_int * genome.frac_memory)
-    n_exc = n_int - n_inhib - n_modul - n_mem_internal
-
-    internal_types = (
-        [list(NodeType).index(NodeType.E)] * n_exc +
-        [list(NodeType).index(NodeType.I)] * n_inhib +
-        [list(NodeType).index(NodeType.M)] * n_modul +
-        [list(NodeType).index(NodeType.Mem)] * n_mem_internal
-    )
+    n_exc = n_int - n_inhib
+    internal_types = [_NTYPE_E] * n_exc + [_NTYPE_I] * n_inhib
     rng.shuffle(internal_types)
     node_types[internal_start:internal_start + n_int] = internal_types
 
-    n_concept_I = max(1, int(n_concept * 0.2))
-    concept_types = ([list(NodeType).index(NodeType.E)] * (n_concept - n_concept_I) +
-                     [list(NodeType).index(NodeType.I)] * n_concept_I)
-    rng.shuffle(concept_types)
-    node_types[concept_start:concept_start + n_concept] = concept_types
-
-    # Memory pool nodes are all excitatory (self-sustaining)
-    node_types[memory_start:memory_start + n_mem] = list(NodeType).index(NodeType.E)
-
-    # ── Regions ─────────────────────────────────────────────────────
+    # Regions
+    _reg = list(Region)
     regions = np.zeros(n_total, dtype=int)
-    regions[sensory] = list(Region).index(Region.SENSORY)
-    regions[internal] = list(Region).index(Region.ABSTRACT)
-    regions[concept] = list(Region).index(Region.ABSTRACT)
-    regions[memory] = list(Region).index(Region.MEMORY)
-    regions[motor] = list(Region).index(Region.MOTOR)
+    regions[sensory] = _reg.index(Region.SENSORY)
+    regions[internal] = _reg.index(Region.INTERNAL)
+    regions[memory] = _reg.index(Region.MEMORY)
+    regions[motor] = _reg.index(Region.MOTOR)
 
-    # ── Leak rates ──────────────────────────────────────────────────
+    # Leak rates per node type
     _ntype_list = list(NodeType)
     leak_rates = np.array([DEFAULT_LEAK[_ntype_list[t]] for t in node_types])
-    # Memory pool: very slow leak so activity persists
-    leak_rates[memory] = 0.02
+    leak_rates[memory] = 0.02  # very slow leak for persistent activity
+
+    # Per-node parameters: different for E vs I
+    max_rate = np.full(n_total, genome.max_rate_E)
+    adapt_rate = np.full(n_total, genome.adapt_rate_E)
+    i_mask = node_types == _NTYPE_I
+    max_rate[i_mask] = genome.max_rate_I
+    adapt_rate[i_mask] = genome.adapt_rate_I
 
     column_ids = np.full(n_total, -1, dtype=np.int32)
 
@@ -98,6 +85,8 @@ def create_dng(
         regions=regions,
         excitability=np.ones(n_total),
         leak_rates=leak_rates,
+        max_rate=max_rate,
+        adapt_rate=adapt_rate,
         input_nodes=sensory,
         output_nodes=motor,
         memory_nodes=memory,
@@ -113,89 +102,67 @@ def create_dng(
     ws = genome.weight_scale
     cap = genome.max_fan_in
 
-    # ── Local receptive field connections (sensory <-> internal) ────
-    # Each internal neuron is assigned a grid position and connects to
-    # a local patch of sensory neurons (like V1 receptive fields).
+    # SENSORY -> INTERNAL: local receptive fields
     _local_rf_edges(
         net, sensory_start, internal, grid_h, grid_w, n_cells,
         rf_radius=2, long_range_frac=0.15, ws=ws, rng=rng,
         direction='sensory_to_internal',
+        n_sensory=n_sensory,
     )
 
-    # Internal -> Motor: local + long-range connections so motor neurons
-    # can receive input from internal neurons at distant grid positions.
-    # Essential for spatial transformations (flip, rotate, transpose).
+    # INTERNAL -> MOTOR: start very weak (must learn proper mappings)
     _local_rf_edges(
         net, motor_start, internal, grid_h, grid_w, n_cells,
-        rf_radius=2, long_range_frac=0.35, ws=ws, rng=rng,
+        rf_radius=2, long_range_frac=0.35, ws=ws * 0.01, rng=rng,
         direction='internal_to_motor',
+        n_sensory=n_sensory,
     )
 
-    # Internal <-> Internal: lateral connections (can stay random)
+    # INTERNAL <-> INTERNAL: lateral connections
     fan_i2i = _fan_in(genome.density_internal_to_internal, n_int, cap)
     _fan_in_edges(net, internal, internal, fan_i2i, ws, rng)
 
-    # Motor -> Internal (feedback): random but sparse
-    fan_m2i = _fan_in(genome.density_motor_to_internal, n_io, cap)
+    # MOTOR -> INTERNAL: feedback
+    fan_m2i = _fan_in(genome.density_motor_to_internal, n_motor, cap)
     _fan_in_edges(net, motor, internal, fan_m2i, ws, rng)
 
-    # Internal -> Sensory (top-down feedback): sparse
+    # INTERNAL -> SENSORY: top-down feedback
     fan_i2s = _fan_in(genome.density_internal_to_sensory, n_int, cap)
     _fan_in_edges(net, internal, sensory, fan_i2s, ws, rng)
 
-    # Sensory -> Motor (weak direct path, NOT the copy pathway)
-    fan_s2m = _fan_in(genome.density_sensory_to_motor, n_io, cap)
+    # SENSORY -> MOTOR: weak direct path (NOT the copy pathway)
+    fan_s2m = _fan_in(genome.density_sensory_to_motor, n_sensory, cap)
     _fan_in_edges(net, sensory, motor, fan_s2m, ws, rng)
 
-    # Concept pool: pools from multiple internal groups (larger receptive fields)
-    fan_c2concept = _fan_in(genome.density_column_to_concept, n_int, cap)
-    fan_concept2c = _fan_in(genome.density_concept_to_column, n_concept, cap)
-    _fan_in_edges(net, internal, concept, fan_c2concept, ws, rng)
-    _fan_in_edges(net, concept, internal, fan_concept2c, ws, rng)
-    _fan_in_edges(net, concept, concept, min(max(2, n_concept // 5), cap), ws, rng)
-    _fan_in_edges(net, concept, motor, min(max(10, n_concept // 3), cap), ws, rng)
-    _fan_in_edges(net, sensory, concept, min(max(10, n_io // 8), cap), ws, rng)
-
-    # ── Hippocampal memory circuit ───────────────────────────────────
-    # Dense autoassociative recurrence (CA3-like pattern completion).
-    # Each memory node connects to ~half the others so partial cues
-    # can reactivate full stored patterns via attractor dynamics.
+    # MEMORY circuit
     mem_ws = ws * 5
     mem_fan_in = min(max(10, n_mem // 2), cap)
     _fan_in_edges(net, memory, memory, mem_fan_in, mem_ws, rng)
-
-    # Internal -> Memory (write path)
     _fan_in_edges(net, internal, memory, min(max(10, n_int // 5), cap), mem_ws, rng)
-    # Memory -> Internal (recall path)
     _fan_in_edges(net, memory, internal, min(max(10, n_mem // 2), cap), mem_ws, rng)
-    # Concept -> Memory (abstract patterns get stored)
-    _fan_in_edges(net, concept, memory, min(max(5, n_concept // 3), cap), mem_ws, rng)
-    # Memory -> Concept (recalled memories inform abstraction)
-    _fan_in_edges(net, memory, concept, min(max(5, n_mem // 3), cap), mem_ws, rng)
-    # Memory -> Motor (direct recall to output -- strong, so memory can drive answers)
     _fan_in_edges(net, memory, motor, min(max(10, n_mem // 2), cap), mem_ws, rng)
-    # Sensory -> Memory (direct perception to memory)
-    _fan_in_edges(net, sensory, memory, min(max(5, n_io // 15), cap), mem_ws, rng)
+    _fan_in_edges(net, sensory, memory, min(max(5, n_sensory // 15), cap), mem_ws, rng)
 
-    # ── Instinct: Copy pathway ──────────────────────────────────────
-    # Direct 1:1 sensory[cell,color] -> motor[cell,color] connections.
-    # Weak initial copy -- same magnitude as other connections so CHL
-    # can strengthen or weaken it based on whether copying is useful.
-    copy_src = sensory.copy()
-    copy_dst = motor.copy()
-    copy_w = np.full(len(copy_src), ws)
-    idx = net._edge_count
-    n_new = len(copy_src)
-    net._ensure_capacity(idx + n_new)
-    net._edge_src[idx:idx + n_new] = copy_src
-    net._edge_dst[idx:idx + n_new] = copy_dst
-    net._edge_w[idx:idx + n_new] = copy_w
-    net._edge_count += n_new
-    net._csr_dirty = True
+    # INSTINCT: Copy pathway — sensory COLOR nodes -> motor nodes (1:1)
+    # Only the first 10 features per cell are color one-hots
+    copy_src = []
+    copy_dst = []
+    for cell in range(n_cells):
+        for k in range(NUM_COLORS):
+            s_idx = sensory_start + cell * FEATURES_PER_CELL + k
+            m_idx = motor_start + cell * NUM_COLORS + k
+            copy_src.append(s_idx)
+            copy_dst.append(m_idx)
+    copy_src = np.array(copy_src, dtype=np.int32)
+    copy_dst = np.array(copy_dst, dtype=np.int32)
+    copy_w = np.full(len(copy_src), 2.0)
+    edge_start = net._edge_count
+    net.add_edges_batch(copy_src, copy_dst, copy_w)
+    edge_end = net._edge_count
+    # Instinct consolidation: innate pathway, scaling preserves dominance
+    net._edge_consolidation[edge_start:edge_end] = 20.0
 
-    # Spatial neighbor connections
-    _spatial_neighbors(net, sensory_start, grid_h, grid_w,
-                       genome.density_sensory_neighbors, ws, rng)
+    # Spatial neighbor connections for motor
     _spatial_neighbors(net, motor_start, grid_h, grid_w,
                        genome.density_motor_neighbors, ws, rng)
 
@@ -214,23 +181,26 @@ def _local_rf_edges(
     ws: float,
     rng: np.random.Generator,
     direction: str,
+    n_sensory: int = 0,
 ) -> None:
     """
-    Create spatially structured connections between I/O layer and internal layer.
+    Spatially structured connections between I/O layer and internal layer.
 
-    Each internal neuron is assigned a grid position. It connects to all
-    color channels of cells within `rf_radius` of that position, plus a
-    fraction of random long-range connections for global context.
+    For sensory_to_internal: connects perception feature nodes (all 28 per cell)
+    within the receptive field to internal neurons.
 
-    direction: 'sensory_to_internal' or 'internal_to_motor'
+    For internal_to_motor: connects internal to motor color nodes (10 per cell).
     """
     n_int = len(internal)
-    n_io = n_cells * NUM_COLORS
 
-    # Assign each internal neuron to a grid cell (cycling through positions)
+    if direction == 'sensory_to_internal':
+        features_per_cell = FEATURES_PER_CELL
+        n_io = n_sensory
+    else:
+        features_per_cell = NUM_COLORS
+        n_io = n_cells * NUM_COLORS
+
     cell_assignments = np.arange(n_int) % n_cells
-
-    # Precompute grid coordinates for each cell
     cell_row = np.arange(n_cells) // grid_w
     cell_col = np.arange(n_cells) % grid_w
 
@@ -240,7 +210,6 @@ def _local_rf_edges(
         center_cell = cell_assignments[idx]
         cr, cc = cell_row[center_cell], cell_col[center_cell]
 
-        # Local patch: all cells within rf_radius (Chebyshev distance)
         local_cells = []
         for dr in range(-rf_radius, rf_radius + 1):
             for dc in range(-rf_radius, rf_radius + 1):
@@ -248,15 +217,14 @@ def _local_rf_edges(
                 if 0 <= nr < grid_h and 0 <= nc < grid_w:
                     local_cells.append(nr * grid_w + nc)
 
-        # All color channels of local cells
         local_io_nodes = []
         for cell in local_cells:
-            for k in range(NUM_COLORS):
-                local_io_nodes.append(io_start + cell * NUM_COLORS + k)
+            for k in range(features_per_cell):
+                local_io_nodes.append(io_start + cell * features_per_cell + k)
 
-        # Long-range: random sample from ALL io nodes
         n_long = max(1, int(len(local_io_nodes) * long_range_frac))
         all_io = np.arange(io_start, io_start + n_io)
+        n_long = min(n_long, len(all_io))
         long_range = rng.choice(all_io, size=n_long, replace=False)
 
         all_connected = np.unique(np.concatenate([
@@ -268,7 +236,7 @@ def _local_rf_edges(
             for io_node in all_connected:
                 src_list.append(int(io_node))
                 dst_list.append(int(int_node))
-        else:  # internal_to_motor
+        else:
             for io_node in all_connected:
                 src_list.append(int(int_node))
                 dst_list.append(int(io_node))
@@ -278,8 +246,6 @@ def _local_rf_edges(
 
     all_src = np.array(src_list, dtype=np.int32)
     all_dst = np.array(dst_list, dtype=np.int32)
-
-    # Remove self-loops
     valid = all_src != all_dst
     sel_src = all_src[valid]
     sel_dst = all_dst[valid]
@@ -287,15 +253,7 @@ def _local_rf_edges(
     magnitudes = np.abs(rng.normal(0, ws, size=len(sel_src)))
     signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
     sel_w = signs * magnitudes
-
-    n_new = len(sel_src)
-    idx_start = net._edge_count
-    net._ensure_capacity(idx_start + n_new)
-    net._edge_src[idx_start:idx_start + n_new] = sel_src
-    net._edge_dst[idx_start:idx_start + n_new] = sel_dst
-    net._edge_w[idx_start:idx_start + n_new] = sel_w
-    net._edge_count += n_new
-    net._csr_dirty = True
+    net.add_edges_batch(sel_src, sel_dst, sel_w)
 
 
 def _fan_in(density: float, source_size: int, cap: int = 9999) -> int:
@@ -310,14 +268,17 @@ def _fan_in_edges(
     weight_scale: float,
     rng: np.random.Generator,
 ) -> None:
-    """Each dst node gets `fan_in` random connections from src nodes (vectorized)."""
+    """Each dst node gets `fan_in` random connections from src nodes."""
     n_src = len(src_nodes)
     n_dst = len(dst_nodes)
     if n_src == 0 or n_dst == 0 or fan_in <= 0:
         return
 
     fan_in = min(fan_in, n_src)
-
+    if fan_in >= n_src:
+        fan_in = n_src - 1
+    if fan_in <= 0:
+        return
     max_chunk = max(1, 5_000_000 // n_src)
     all_src_parts, all_dst_parts = [], []
 
@@ -325,16 +286,13 @@ def _fan_in_edges(
         end = min(start + max_chunk, n_dst)
         chunk_dst = dst_nodes[start:end]
         chunk_n = len(chunk_dst)
-
         rand_matrix = rng.random((chunk_n, n_src))
         chosen_idx = np.argpartition(rand_matrix, fan_in, axis=1)[:, :fan_in]
-
         all_src_parts.append(src_nodes[chosen_idx.ravel()])
         all_dst_parts.append(np.repeat(chunk_dst, fan_in))
 
     all_src = np.concatenate(all_src_parts)
     all_dst = np.concatenate(all_dst_parts)
-
     valid = all_src != all_dst
     sel_src = all_src[valid]
     sel_dst = all_dst[valid]
@@ -342,15 +300,7 @@ def _fan_in_edges(
     magnitudes = np.abs(rng.normal(0, weight_scale, size=len(sel_src)))
     signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
     sel_w = signs * magnitudes
-
-    idx = net._edge_count
-    n_new = len(sel_src)
-    net._ensure_capacity(idx + n_new)
-    net._edge_src[idx:idx + n_new] = sel_src
-    net._edge_dst[idx:idx + n_new] = sel_dst
-    net._edge_w[idx:idx + n_new] = sel_w
-    net._edge_count += n_new
-    net._csr_dirty = True
+    net.add_edges_batch(sel_src, sel_dst, sel_w)
 
 
 def _spatial_neighbors(
@@ -384,18 +334,9 @@ def _spatial_neighbors(
     all_src = np.array(src_list, dtype=np.int32)
     all_dst = np.array(dst_list, dtype=np.int32)
     mask = rng.random(len(all_src)) < density
-
     sel_src = all_src[mask]
     sel_dst = all_dst[mask]
     magnitudes = np.abs(rng.normal(0, weight_scale, size=len(sel_src)))
     signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
     sel_w = signs * magnitudes
-
-    idx = net._edge_count
-    n_new = len(sel_src)
-    net._ensure_capacity(idx + n_new)
-    net._edge_src[idx:idx + n_new] = sel_src
-    net._edge_dst[idx:idx + n_new] = sel_dst
-    net._edge_w[idx:idx + n_new] = sel_w
-    net._edge_count += n_new
-    net._csr_dirty = True
+    net.add_edges_batch(sel_src, sel_dst, sel_w)
