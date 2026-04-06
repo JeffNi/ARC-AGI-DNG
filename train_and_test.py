@@ -91,8 +91,6 @@ print(f"\nNetwork: {net.n_nodes} nodes, {net.edge_count()} edges")
 config = LifecycleConfig(
     observe_steps=40,
     think_steps=40,
-    free_phase_steps=40,
-    clamped_phase_steps=40,
     eta=0.05,
     w_max=2.5,
     noise_std=0.02,

@@ -131,10 +131,10 @@ def create_dng(
         direction='sensory_to_internal',
     )
 
-    # Layer 1 -> Layer 2: wider pooling (radius 3 ≈ 7x7 patch on 10x10 grid)
+    # Layer 1 -> Layer 2: wider pooling
     _inter_layer_rf_edges(
         net, layer1, layer2, grid_h, grid_w, n_cells,
-        rf_radius=3, long_range_frac=0.15, ws=ws, rng=rng,
+        rf_radius=4, long_range_frac=0.20, ws=ws, rng=rng,
     )
 
     # Layer 2 -> Motor: local RFs with moderate long-range
@@ -162,42 +162,29 @@ def create_dng(
     # Layer 2 lateral
     _fan_in_edges(net, layer2, layer2, SEED, seed_ws, rng)
 
-    # Feedback paths — top-down signal flow is critical for CHL.
-    # During clamped phase, correct output on motor neurons must
-    # propagate backwards to shape internal correlations.
-    FEEDBACK_FAN = 20
-    _fan_in_edges(net, motor, layer2, min(FEEDBACK_FAN, n_io), seed_ws, rng)
-    _fan_in_edges(net, layer2, layer1, min(FEEDBACK_FAN, n_L2), seed_ws, rng)
+    # Feedback paths
+    _fan_in_edges(net, motor, layer2, min(SEED, n_io), seed_ws, rng)
     _fan_in_edges(net, layer1, sensory, min(SEED, n_L1), ws, rng)
 
-    # Sensory -> Motor (non-copy, bypasses internal layers)
+    # Sensory -> Motor (non-copy)
     _fan_in_edges(net, sensory, motor, min(5, n_io), ws, rng)
 
-    # Concept pool: association cortex — sparse at birth, matures through
-    # experience. Needs enough input to participate in activity, but the
-    # real wiring comes from synaptogenesis during infancy/childhood.
-    CONCEPT_FAN = 25
-    _fan_in_edges(net, layer2, concept, CONCEPT_FAN, seed_ws, rng)
-    _fan_in_edges(net, layer1, concept, min(15, n_L1), seed_ws, rng)
-    _fan_in_edges(net, concept, layer2, min(CONCEPT_FAN, n_concept), seed_ws, rng)
-    _fan_in_edges(net, concept, layer1, min(10, n_concept), seed_ws, rng)
-    _fan_in_edges(net, concept, concept, min(15, n_concept), seed_ws, rng)
-    _fan_in_edges(net, concept, motor, min(15, n_concept), seed_ws, rng)
-    _fan_in_edges(net, sensory, concept, min(10, n_io), seed_ws, rng)
+    # Concept pool: needs strong enough input to actually fire
+    _fan_in_edges(net, layer2, concept, SEED, seed_ws, rng)
+    _fan_in_edges(net, concept, layer2, min(SEED, n_concept), seed_ws, rng)
+    _fan_in_edges(net, concept, concept, min(5, n_concept), seed_ws, rng)
+    _fan_in_edges(net, concept, motor, min(5, n_concept), ws, rng)
+    _fan_in_edges(net, sensory, concept, min(5, n_io), seed_ws, rng)
 
-    # ── Hippocampal memory circuit ───────────────────────────────────
-    # Hippocampus has moderate initial wiring, specialized for rapid
-    # one-shot encoding. Needs strong bidirectional paths to both
-    # internal layers and concept pool for episodic storage/recall.
-    MEM_FAN = 20
+    # ── Hippocampal memory circuit (sparse seeds) ─────────────────────
     mem_seed_ws = seed_ws * 2
-    _fan_in_edges(net, memory, memory, MEM_FAN, mem_seed_ws, rng)
-    _fan_in_edges(net, internal, memory, MEM_FAN, mem_seed_ws, rng)
-    _fan_in_edges(net, memory, internal, min(MEM_FAN, n_mem), mem_seed_ws, rng)
-    _fan_in_edges(net, concept, memory, min(15, n_concept), mem_seed_ws, rng)
-    _fan_in_edges(net, memory, concept, min(15, n_mem), mem_seed_ws, rng)
-    _fan_in_edges(net, memory, motor, min(15, n_mem), seed_ws, rng)
-    _fan_in_edges(net, sensory, memory, min(10, n_io), mem_seed_ws, rng)
+    _fan_in_edges(net, memory, memory, SEED, mem_seed_ws, rng)
+    _fan_in_edges(net, internal, memory, SEED, mem_seed_ws, rng)
+    _fan_in_edges(net, memory, internal, min(SEED, n_mem), mem_seed_ws, rng)
+    _fan_in_edges(net, concept, memory, min(5, n_concept), mem_seed_ws, rng)
+    _fan_in_edges(net, memory, concept, min(5, n_mem), mem_seed_ws, rng)
+    _fan_in_edges(net, memory, motor, min(5, n_mem), ws, rng)
+    _fan_in_edges(net, sensory, memory, min(5, n_io), mem_seed_ws, rng)
 
     # ── Instinct: Copy pathway (reflex arc) ─────────────────────────
     # Direct 1:1 sensory[cell,color] -> motor[cell,color].
@@ -216,25 +203,9 @@ def create_dng(
     net._edge_count += n_new
     net._csr_dirty = True
 
-    # ── Motor self-recurrence (working memory) ───────────────────────
-    # Each motor neuron connects to itself. This creates "stickiness":
-    # once a pattern is established on motor neurons, it persists even
-    # after the driving signal is removed. Like prefrontal recurrent
-    # loops that maintain working memory.
-    SELF_W = 0.9
-    self_src = motor.copy()
-    self_dst = motor.copy()
-    self_w = np.full(len(self_src), SELF_W)
-    idx2 = net._edge_count
-    n_self = len(self_src)
-    net._ensure_capacity(idx2 + n_self)
-    net._edge_src[idx2:idx2 + n_self] = self_src
-    net._edge_dst[idx2:idx2 + n_self] = self_dst
-    net._edge_w[idx2:idx2 + n_self] = self_w
-    net._edge_count += n_self
-    net._csr_dirty = True
-
-    # Motor neurons: slow leak so patterns persist (working memory)
+    # Motor neurons: moderate leak. No self-recurrence -- motor neurons
+    # accumulate evidence from all pathways during think(), and the output
+    # is read via argmax at the end (evidence accumulation model).
     leak_rates[motor] = 0.1
 
     # Spatial neighbor connections

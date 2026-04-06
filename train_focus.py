@@ -129,8 +129,6 @@ config = LifecycleConfig(
     consolidation_steps=20,
     eta=0.0,
     w_max=2.5,
-    free_phase_steps=40,
-    clamped_phase_steps=40,
     noise_std=0.02,
     focus_strength=0.5,
     rest_steps=20,
@@ -387,7 +385,7 @@ def echo_test(net, test_input, test_output, cfg, binding_eta=0.0):
     think(net, signal=input_only, steps=RECALL_STEPS,
           noise_std=cfg.noise_std * 0.3)
 
-    guess = signal_to_grid(net.r, out_h, out_w,
+    guess = signal_to_grid(net.V, out_h, out_w,
                            node_offset=motor_offset, max_h=mh, max_w=mw)
     m = analyze_output(guess, test_output, test_input)
     return guess, m
@@ -454,7 +452,7 @@ def focus_session(
         think(net, signal=test_signal, steps=cfg.think_steps,
               noise_std=cfg.noise_std)
 
-        guess = signal_to_grid(net.r, out_h, out_w,
+        guess = signal_to_grid(net.V, out_h, out_w,
                                node_offset=motor_offset, max_h=mh, max_w=mw)
 
         m = analyze_output(guess, test_output, test_input)
