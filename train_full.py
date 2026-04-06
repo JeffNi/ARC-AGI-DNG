@@ -19,6 +19,7 @@ from src.childhood import ChildhoodConfig, run_childhood, extract_tasks
 from src.curriculum import sort_by_difficulty
 from src.pipeline import LifecycleConfig, solve_task
 from src.graph import DNG, Region
+from src.episodic_memory import EpisodicMemory
 
 # ── Args ─────────────────────────────────────────────────────────────
 
@@ -116,11 +117,11 @@ lifecycle = LifecycleConfig(
     observe_steps=40,
     think_steps=60,
     consolidation_steps=20,
-    eta=0.03,
+    eta=0.0,                     # NO CHL during tasks (CLS: only in sleep)
     w_max=2.5,
     free_phase_steps=40,
     clamped_phase_steps=40,
-    attempts_per_round=4,
+    attempts_per_round=3,
     n_rounds=2,
     stuck_patience=2,
     noise_std=0.02,
@@ -131,9 +132,14 @@ lifecycle = LifecycleConfig(
     sleep_tag_threshold=0.001,
     prune_weak_threshold=0.0,
     prune_cycles_required=999,
-    replay_eta=0.03,
-    replay_passes=10,
+    replay_eta=0.0001,           # CLS: very slow neocortical learning
+    replay_passes=3,             # 3 passes through ALL episodic memories
     replay_steps=30,
+    consolidation_decay=0.99,
+    consolidation_strength=0.0,  # disabled during CLS exploration
+    consolidation_threshold=0.9,
+    memory_hint_strength=1.5,    # strong episodic recall hints
+    spontaneous_strength=0.3,
 )
 
 print(f"\n{'='*60}", flush=True)
@@ -141,8 +147,11 @@ print(f"CHILDHOOD: {childhood_config.n_days} days, "
       f"{childhood_config.tasks_per_day} tasks/day", flush=True)
 print(f"{'='*60}", flush=True)
 
+episodic = EpisodicMemory(max_h=MAX_H, max_w=MAX_W, capacity=200)
+
 t0 = time.time()
-result = run_childhood(net, all_tasks, childhood_config, lifecycle, rng)
+result = run_childhood(net, all_tasks, childhood_config, lifecycle, rng,
+                       episodic=episodic)
 elapsed = time.time() - t0
 
 print(f"\nChildhood complete in {elapsed:.0f}s ({elapsed/60:.1f}m)", flush=True)
@@ -183,7 +192,8 @@ for task in eval_tasks_raw[:30]:
         out_h, out_w = test_out.shape
 
         result = solve_task(net, train_pairs, test_inp, eval_config,
-                            output_h=out_h, output_w=out_w)
+                            output_h=out_h, output_w=out_w,
+                            episodic=episodic)
         fg = test_out != 0
         acc = float(np.mean(result.grid[fg] == test_out[fg])) if fg.any() else 1.0
 

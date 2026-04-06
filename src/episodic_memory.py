@@ -205,6 +205,46 @@ class EpisodicMemory:
 
         return hint * strength * sim
 
+    def save(self, path: str) -> None:
+        """Save all episodes to a compressed npz file."""
+        if not self.episodes:
+            np.savez_compressed(path, max_h=self.max_h, max_w=self.max_w,
+                                capacity=self.capacity, n_episodes=0)
+            return
+        inputs = [ep.input_grid for ep in self.episodes]
+        outputs = [ep.output_grid for ep in self.episodes]
+        # Store shapes so we can reconstruct variable-size grids
+        shapes = np.array([(ig.shape[0], ig.shape[1], og.shape[0], og.shape[1])
+                           for ig, og in zip(inputs, outputs)])
+        max_cells = max(ig.size for ig in inputs + outputs)
+        inp_flat = np.zeros((len(inputs), max_cells), dtype=np.int32)
+        out_flat = np.zeros((len(outputs), max_cells), dtype=np.int32)
+        for i, (ig, og) in enumerate(zip(inputs, outputs)):
+            inp_flat[i, :ig.size] = ig.ravel()
+            out_flat[i, :og.size] = og.ravel()
+        np.savez_compressed(path, max_h=self.max_h, max_w=self.max_w,
+                            capacity=self.capacity, n_episodes=len(self.episodes),
+                            shapes=shapes, inp_flat=inp_flat, out_flat=out_flat)
+
+    @classmethod
+    def load(cls, path: str) -> "EpisodicMemory":
+        """Load episodes from a compressed npz file."""
+        data = np.load(path)
+        mem = cls(max_h=int(data["max_h"]), max_w=int(data["max_w"]),
+                  capacity=int(data["capacity"]))
+        n = int(data["n_episodes"])
+        if n == 0:
+            return mem
+        shapes = data["shapes"]
+        inp_flat = data["inp_flat"]
+        out_flat = data["out_flat"]
+        for i in range(n):
+            ih, iw, oh, ow = shapes[i]
+            inp = inp_flat[i, :ih * iw].reshape(ih, iw)
+            out = out_flat[i, :oh * ow].reshape(oh, ow)
+            mem.store(inp, out)
+        return mem
+
     def clear(self) -> None:
         """Wipe all stored memories."""
         self.episodes.clear()

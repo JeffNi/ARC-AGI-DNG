@@ -123,58 +123,60 @@ def _schedule(
         focus_strength=base_lifecycle.focus_strength,
     )
 
-    base_eta = base_lifecycle.eta
-
-    # Shared: no weight decay (consolidation protects important synapses).
+    # CLS: NO CHL during task solving (eta=0). Learning only in sleep.
+    # Replay eta increases slightly as more memories accumulate.
+    lc.eta = 0.0
     lc.sleep_downscale = 1.0
     lc.sleep_tag_threshold = 0.001
-    lc.replay_eta = base_lifecycle.replay_eta
-    lc.replay_passes = base_lifecycle.replay_passes
-    lc.replay_steps = base_lifecycle.replay_steps
+    lc.consolidation_strength = 0.0
 
     if progress < config.childhood_end:
-        # CHILDHOOD: high growth, no pruning -- overshoot phase.
-        lc.eta = base_eta
+        # CHILDHOOD: high growth, generous replay, no pruning.
         lc.n_rounds = 2
-        lc.attempts_per_round = 4
+        lc.attempts_per_round = 3
         lc.growth_rate = 0.3
         lc.growth_candidates = 50000
         lc.prune_weak_threshold = 0.0
         lc.prune_cycles_required = 999
+        lc.replay_eta = base_lifecycle.replay_eta
+        lc.replay_passes = base_lifecycle.replay_passes
+        lc.replay_steps = base_lifecycle.replay_steps
 
     elif progress < config.adolescence_end:
-        # ADOLESCENCE: moderate growth, gentle pruning of unused edges.
-        phase_progress = ((progress - config.childhood_end)
-                          / (config.adolescence_end - config.childhood_end))
-        lc.eta = base_eta * (1.0 - 0.4 * phase_progress)
+        # ADOLESCENCE: moderate growth, gentle pruning, more replay.
         lc.n_rounds = 2
         lc.attempts_per_round = 3
         lc.growth_rate = 0.15
         lc.growth_candidates = 30000
         lc.prune_weak_threshold = 0.002
         lc.prune_cycles_required = 5
+        lc.replay_eta = base_lifecycle.replay_eta * 2
+        lc.replay_passes = base_lifecycle.replay_passes + 2
+        lc.replay_steps = base_lifecycle.replay_steps
 
     elif progress < config.stabilization_end:
-        # STABILIZATION: low growth, moderate pruning -- circuits sharpen.
-        phase_progress = ((progress - config.adolescence_end)
-                          / (config.stabilization_end - config.adolescence_end))
-        lc.eta = base_eta * (0.6 - 0.3 * phase_progress)
+        # STABILIZATION: low growth, moderate pruning.
         lc.n_rounds = 2
         lc.attempts_per_round = 3
         lc.growth_rate = 0.05
         lc.growth_candidates = 10000
         lc.prune_weak_threshold = 0.005
         lc.prune_cycles_required = 3
+        lc.replay_eta = base_lifecycle.replay_eta * 3
+        lc.replay_passes = base_lifecycle.replay_passes + 4
+        lc.replay_steps = base_lifecycle.replay_steps
 
     else:
-        # YOUNG ADULT: rare growth, gentle pruning -- mature circuits.
-        lc.eta = base_eta * 0.2
+        # YOUNG ADULT: mature circuits, strong replay consolidation.
         lc.n_rounds = 2
         lc.attempts_per_round = 2
         lc.growth_rate = 0.02
         lc.growth_candidates = 5000
         lc.prune_weak_threshold = 0.003
         lc.prune_cycles_required = 5
+        lc.replay_eta = base_lifecycle.replay_eta * 5
+        lc.replay_passes = base_lifecycle.replay_passes + 6
+        lc.replay_steps = base_lifecycle.replay_steps
 
     return lc
 
@@ -185,6 +187,7 @@ def run_childhood(
     config: ChildhoodConfig | None = None,
     lifecycle: LifecycleConfig | None = None,
     rng: np.random.Generator | None = None,
+    episodic=None,
 ) -> ChildhoodResult:
     if config is None:
         config = ChildhoodConfig()
@@ -197,7 +200,6 @@ def run_childhood(
     day_edges = []
     ema_r = None
     ema_reward = None
-    replay_buffer: dict = {}
 
     for day in range(1, config.n_days + 1):
         progress = day / config.n_days
@@ -222,7 +224,7 @@ def run_childhood(
         today = [all_tasks[i] for i in indices]
 
         day_result, ema_r = study_day(net, today, day_lc, ema_r, rng,
-                                      replay_buffer=replay_buffer)
+                                      episodic=episodic)
         day_rewards.append(day_result.mean_reward)
         day_edges.append(day_result.edges_after)
 
@@ -234,15 +236,15 @@ def run_childhood(
         if config.verbose:
             solves = sum(1 for a in day_result.attempts if a.reward >= 1.0)
             rewards = [f"{a.reward:.0%}({a.n_attempts})" for a in day_result.attempts]
-            n_cons = int((net._edge_consolidation[:net._edge_count] > 0.1).sum())
+            n_eps = len(episodic.episodes) if episodic is not None else 0
             print(f"  Day {day:3d} [{phase:>7s}] ACh={net.ach:.2f} "
-                  f"eta={day_lc.eta:.3f}: "
+                  f"replay_eta={day_lc.replay_eta:.5f}: "
                   f"reward={day_result.mean_reward:.2f} "
                   f"ema={ema_reward:.2f} "
                   f"solves={solves}/{len(day_result.attempts)} "
                   f"edges={day_result.edges_after} "
                   f"+{day_result.n_grown}/-{day_result.n_pruned} "
-                  f"cons={n_cons} replay={len(replay_buffer)} "
+                  f"episodic={n_eps} "
                   f"[{', '.join(rewards)}]", flush=True)
 
         if config.checkpoint_path and _should_checkpoint(day):
