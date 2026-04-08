@@ -115,6 +115,9 @@ class TestMotorReadout:
 class TestApplyReward:
     def test_positive_reward_changes_weights(self):
         brain = _birth_brain()
+        # Advance to childhood so plasticity_rate > 0 (infancy has no BCM)
+        brain.stage_manager.transition_to("childhood")
+        brain.stage_manager._transition_progress = 1.0
         grid = np.ones((3, 3), dtype=int)
         from src.encoding import grid_to_signal
         signal = grid_to_signal(grid, max_h=3, max_w=3)
@@ -133,6 +136,8 @@ class TestApplyReward:
 
     def test_negative_reward_weakens(self):
         brain = _birth_brain()
+        brain.stage_manager.transition_to("childhood")
+        brain.stage_manager._transition_progress = 1.0
         ne = brain.net._edge_count
         brain.net._edge_eligibility[:ne] = 0.5
         w_before = brain.net._edge_w[:ne].copy()

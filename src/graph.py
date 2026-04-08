@@ -38,17 +38,45 @@ class Region(enum.Enum):
     INTERNAL = "internal"
     MOTOR = "motor"
     MEMORY = "memory"
-    # Phase 2 regions (kept for future use)
     LOCAL_DETECT = "local_detect"
     MID_LEVEL = "mid_level"
     ABSTRACT = "abstract"
 
+
+# Cortical hierarchy layers (ordered low → high)
+CORTICAL_LAYERS = (Region.LOCAL_DETECT, Region.MID_LEVEL, Region.ABSTRACT)
+# All regions that count as "internal processing" (for backward compat)
+INTERNAL_REGIONS = (Region.INTERNAL,) + CORTICAL_LAYERS
+
+_REG_LIST = list(Region)
 
 _NTYPE_LIST = list(NodeType)
 _NTYPE_E = _NTYPE_LIST.index(NodeType.E)
 _NTYPE_I = _NTYPE_LIST.index(NodeType.I)
 _NTYPE_M = _NTYPE_LIST.index(NodeType.M)
 _NTYPE_MEM = _NTYPE_LIST.index(NodeType.Mem)
+
+
+def internal_mask(regions: np.ndarray) -> np.ndarray:
+    """Boolean mask for all internal-processing neurons (any cortical layer)."""
+    mask = np.zeros(len(regions), dtype=bool)
+    for reg in INTERNAL_REGIONS:
+        mask |= regions == _REG_LIST.index(reg)
+    return mask
+
+
+def layer_index(region_val: int) -> int:
+    """Map a region integer to cortical layer number (0=L1, 1=L2, 2=L3, -1=not cortical)."""
+    reg = _REG_LIST[region_val] if region_val < len(_REG_LIST) else None
+    if reg == Region.LOCAL_DETECT:
+        return 0
+    elif reg == Region.MID_LEVEL:
+        return 1
+    elif reg == Region.ABSTRACT:
+        return 2
+    elif reg == Region.INTERNAL:
+        return 0
+    return -1
 
 DEFAULT_LEAK = {
     NodeType.E: 0.3,
@@ -116,7 +144,7 @@ class DNG:
     _edge_dst: np.ndarray = field(default=None, repr=False)
     _edge_w: np.ndarray = field(default=None, repr=False)
     _edge_tag: np.ndarray = field(default=None, repr=False)
-    _edge_weak_count: np.ndarray = field(default=None, repr=False)
+    _edge_health: np.ndarray = field(default=None, repr=False)
     _edge_eligibility: np.ndarray = field(default=None, repr=False)
     _edge_count: int = field(default=0, repr=False)
     _edge_capacity: int = field(default=0, repr=False)
@@ -171,7 +199,7 @@ class DNG:
             self._edge_dst = np.empty(cap, dtype=np.int32)
             self._edge_w = np.empty(cap, dtype=np.float64)
             self._edge_tag = np.zeros(cap, dtype=np.float64)
-            self._edge_weak_count = np.zeros(cap, dtype=np.int32)
+            self._edge_health = np.ones(cap, dtype=np.float64)
             self._edge_consolidation = np.zeros(cap, dtype=np.float64)
             self._edge_eligibility = np.zeros(cap, dtype=np.float64)
             self._edge_count = 0
@@ -214,9 +242,10 @@ class DNG:
                 new = np.zeros(new_cap, dtype=np.float64)
                 new[:len(old)] = old
                 setattr(self, attr, new)
-            old_wc = self._edge_weak_count
-            self._edge_weak_count = np.zeros(new_cap, dtype=np.int32)
-            self._edge_weak_count[:len(old_wc)] = old_wc
+            old_health = self._edge_health
+            new_health = np.ones(new_cap, dtype=np.float64)
+            new_health[:len(old_health)] = old_health
+            self._edge_health = new_health
             self._edge_capacity = new_cap
 
     def add_edge(self, src: int, dst: int, weight: float):
@@ -226,7 +255,7 @@ class DNG:
         self._edge_dst[idx] = dst
         self._edge_w[idx] = weight
         self._edge_tag[idx] = 0.0
-        self._edge_weak_count[idx] = 0
+        self._edge_health[idx] = 1.0
         self._edge_count += 1
         self._csr_dirty = True
 
@@ -241,7 +270,7 @@ class DNG:
         self._edge_dst[start:start + n_new] = dsts
         self._edge_w[start:start + n_new] = weights
         self._edge_tag[start:start + n_new] = 0.0
-        self._edge_weak_count[start:start + n_new] = 0
+        self._edge_health[start:start + n_new] = 1.0
         self._edge_eligibility[start:start + n_new] = 0.0
         self._edge_count += n_new
         self._csr_dirty = True
@@ -300,7 +329,7 @@ class DNG:
         self._edge_dst[:alive] = self._edge_dst[:n][mask]
         self._edge_w[:alive] = self._edge_w[:n][mask]
         self._edge_tag[:alive] = self._edge_tag[:n][mask]
-        self._edge_weak_count[:alive] = self._edge_weak_count[:n][mask]
+        self._edge_health[:alive] = self._edge_health[:n][mask]
         self._edge_eligibility[:alive] = self._edge_eligibility[:n][mask]
         self._edge_consolidation[:alive] = self._edge_consolidation[:n][mask]
         self._edge_count = alive
@@ -332,7 +361,7 @@ class DNG:
             edges_dst=self._edge_dst[:n].copy(),
             edges_w=self._edge_w[:n].copy(),
             edges_tag=self._edge_tag[:n].copy(),
-            edges_weak_count=self._edge_weak_count[:n].copy(),
+            edges_health=self._edge_health[:n].copy(),
             edges_eligibility=self._edge_eligibility[:n].copy(),
             edges_consolidation=self._edge_consolidation[:n].copy(),
             column_ids=self.column_ids,
@@ -412,7 +441,7 @@ class DNG:
         net._edge_dst = np.empty(cap, dtype=np.int32)
         net._edge_w = np.empty(cap, dtype=np.float64)
         net._edge_tag = np.zeros(cap, dtype=np.float64)
-        net._edge_weak_count = np.zeros(cap, dtype=np.int32)
+        net._edge_health = np.ones(cap, dtype=np.float64)
         net._edge_eligibility = np.zeros(cap, dtype=np.float64)
         net._edge_consolidation = np.zeros(cap, dtype=np.float64)
         net._edge_src[:n_edges] = src
@@ -420,8 +449,10 @@ class DNG:
         net._edge_w[:n_edges] = w
         if "edges_tag" in data:
             net._edge_tag[:n_edges] = data["edges_tag"]
-        if "edges_weak_count" in data:
-            net._edge_weak_count[:n_edges] = data["edges_weak_count"]
+        if "edges_health" in data:
+            net._edge_health[:n_edges] = data["edges_health"]
+        elif "edges_weak_count" in data:
+            net._edge_health[:n_edges] = 1.0
         if "edges_eligibility" in data:
             net._edge_eligibility[:n_edges] = data["edges_eligibility"]
         if "edges_consolidation" in data:

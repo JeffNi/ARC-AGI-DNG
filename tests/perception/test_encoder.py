@@ -9,20 +9,20 @@ class TestDimensions:
     def test_3x3(self):
         grid = np.ones((3, 3), dtype=int)
         signal = perceive(grid)
-        expected = 9 * FEATURES_PER_CELL + GLOBAL_FEATURES  # 9*28 + 28 = 280
+        expected = 9 * FEATURES_PER_CELL + GLOBAL_FEATURES
         assert len(signal) == expected
         assert len(signal) == sensory_size(3, 3)
 
     def test_5x5(self):
         grid = np.ones((5, 5), dtype=int)
         signal = perceive(grid)
-        expected = 25 * FEATURES_PER_CELL + GLOBAL_FEATURES  # 25*28 + 28 = 728
+        expected = 25 * FEATURES_PER_CELL + GLOBAL_FEATURES
         assert len(signal) == expected
 
     def test_1x1(self):
         grid = np.array([[5]])
         signal = perceive(grid)
-        expected = 1 * FEATURES_PER_CELL + GLOBAL_FEATURES  # 56
+        expected = 1 * FEATURES_PER_CELL + GLOBAL_FEATURES
         assert len(signal) == expected
 
     def test_rectangular(self):
@@ -36,12 +36,13 @@ class TestSegmentPlacement:
         grid = np.array([[3, 7],
                          [0, 5]])
         signal = perceive(grid)
-        # Cell (0,0) = color 3 -> index 0*28 + 3
+        F = FEATURES_PER_CELL
+        # Cell (0,0) = color 3
         assert signal[3] == 1.0
         assert np.sum(signal[0:10]) == 1.0
-        # Cell (0,1) = color 7 -> index 1*28 + 7
-        assert signal[28 + 7] == 1.0
-        assert np.sum(signal[28:38]) == 1.0
+        # Cell (0,1) = color 7
+        assert signal[F + 7] == 1.0
+        assert np.sum(signal[F:F + 10]) == 1.0
 
     def test_boundary_location(self):
         grid = np.array([[1, 0],
@@ -49,12 +50,11 @@ class TestSegmentPlacement:
         signal = perceive(grid)
         # Cell (0,0): ortho boundaries at [10:14], diag at [14:18]
         # Right neighbor (0,1)=0 differs -> d=3 (right)
-        assert signal[13] == 1.0  # 0*28 + 10 + 3
+        assert signal[13] == 1.0  # 0*FEATURES_PER_CELL + 10 + 3
 
     def test_object_features_location(self):
         grid = np.ones((3, 3), dtype=int)
         signal = perceive(grid)
-        # Center cell (1,1) = flat index 4: object features at [4*28+18 : 4*28+26]
         base = 4 * FEATURES_PER_CELL
         obj_size = signal[base + 18]
         assert obj_size == 1.0  # uniform grid, one object covering all
@@ -62,10 +62,9 @@ class TestSegmentPlacement:
     def test_border_flag_location(self):
         grid = np.ones((3, 3), dtype=int)
         signal = perceive(grid)
-        # Center cell (1,1) = flat 4: border flag at 4*28 + 26
-        assert signal[4 * 28 + 26] == 0.0  # interior
-        # Corner (0,0) = flat 0: border flag at 0*28 + 26
-        assert signal[26] == 1.0
+        F = FEATURES_PER_CELL
+        assert signal[4 * F + 26] == 0.0  # interior cell (1,1)
+        assert signal[26] == 1.0  # corner cell (0,0)
 
     def test_global_features_at_end(self):
         grid = np.ones((2, 2), dtype=int)

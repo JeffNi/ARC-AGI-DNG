@@ -24,7 +24,6 @@ from src.brain import Brain
 from src.encoding import grid_to_signal
 from src.homeostasis import Homeostasis, HomeostasisSetpoints, StageManager, STAGES
 from src.homeostasis.scaling import synaptic_scaling
-from src.homeostasis.bcm import update_bcm_theta
 from src.homeostasis.intrinsic import intrinsic_plasticity
 from src.homeostasis.ei_balance import ei_balance_update
 
@@ -162,37 +161,6 @@ class TestSynapticScaling:
         w_after_abs = np.abs(net._edge_w[:ne])
         assert np.mean(w_after_abs) > np.mean(w_before_abs), \
             "Underactive neurons should have weights scaled up"
-
-
-class TestBCMTheta:
-    def test_theta_tracks_activity(self):
-        """Highly active neurons should have higher BCM theta."""
-        n = 20
-        bcm_theta = np.full(n, 0.1)
-        ema = np.zeros(n)
-        ema[:10] = 0.5  # high activity
-        ema[10:] = 0.01  # low activity
-        sp = HomeostasisSetpoints(bcm_tau=0.1)
-
-        for _ in range(100):
-            update_bcm_theta(bcm_theta, ema, sp)
-
-        assert np.mean(bcm_theta[:10]) > np.mean(bcm_theta[10:]), \
-            "Active neurons should have higher theta"
-
-    def test_theta_stable_at_equilibrium(self):
-        """At equilibrium, theta should approximately equal ema_rate^2."""
-        n = 10
-        bcm_theta = np.full(n, 0.1)
-        ema = np.full(n, 0.2)
-        sp = HomeostasisSetpoints(bcm_tau=0.05)
-
-        for _ in range(500):
-            update_bcm_theta(bcm_theta, ema, sp)
-
-        expected = 0.2 ** 2
-        assert np.allclose(bcm_theta, expected, atol=0.01), \
-            f"Theta should converge to rate^2={expected}: got {bcm_theta[0]:.4f}"
 
 
 class TestIntrinsicPlasticity:
@@ -360,7 +328,6 @@ class TestHomeostasisOrchestrator:
         h2.load_state_dict(state)
 
         np.testing.assert_array_almost_equal(h2.ema_rate, h.ema_rate)
-        np.testing.assert_array_almost_equal(h2.bcm_theta, h.bcm_theta)
         assert h2._step_counter == h._step_counter
 
 

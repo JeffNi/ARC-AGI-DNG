@@ -101,9 +101,11 @@ class TestFullLifecycle:
         """Positive DA should strengthen, negative should weaken."""
         genome = Genome(n_internal=50, n_memory=20, max_h=3, max_w=3, wta_k=5)
 
-        # Trial 1: positive DA
+        # Trial 1: positive DA — advance to childhood so plasticity_rate > 0
         brain1 = Brain.birth(genome, grid_h=3, grid_w=3, seed=42,
                             checkpoint_dir=tempfile.mkdtemp())
+        brain1.stage_manager.transition_to("childhood")
+        brain1.stage_manager._transition_progress = 1.0
         grid = np.ones((3, 3), dtype=int) * 3
         signal = grid_to_signal(grid, max_h=3, max_w=3)
         brain1.inject_signal(signal)
@@ -117,6 +119,8 @@ class TestFullLifecycle:
         # Trial 2: negative DA (same starting state)
         brain2 = Brain.birth(genome, grid_h=3, grid_w=3, seed=42,
                             checkpoint_dir=tempfile.mkdtemp())
+        brain2.stage_manager.transition_to("childhood")
+        brain2.stage_manager._transition_progress = 1.0
         brain2.inject_signal(signal)
         brain2.step(n_steps=20)
         ne2 = brain2.net._edge_count
@@ -147,7 +151,6 @@ class TestFullLifecycle:
         assert brain.fatigue.level < 50.0
         assert "replays" in stats
         assert "pruned" in stats
-        assert "grown" in stats
 
     def test_monitor_writes_log(self):
         """Monitor should create a log file with valid JSON-lines."""

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .graph import DNG, _NTYPE_I
+from .graph import DNG, _NTYPE_I, layer_index
 
 
 # ── Correlation recording ─────────────────────────────────────────
@@ -58,7 +58,9 @@ def contrastive_hebbian_update(
     if abs(modulation) < 1e-8:
         return 0.0
 
-    diff = clamped_corr[:n] - free_corr[:n]
+    fc = free_corr[:n] if len(free_corr) >= n else np.pad(free_corr, (0, n - len(free_corr)))
+    cc = clamped_corr[:n] if len(clamped_corr) >= n else np.pad(clamped_corr, (0, n - len(clamped_corr)))
+    diff = cc - fc
     dw = modulation * diff
 
     # Consolidation: well-established synapses resist modification
@@ -202,32 +204,113 @@ def sleep_selective(
     net: DNG,
     downscale: float = 0.95,
     tag_threshold: float = 0.01,
+    ema_rate: np.ndarray | None = None,
+    target_rate: float = 0.15,
 ) -> None:
-    """Selective downscaling: only weaken untagged synapses (SHY hypothesis)."""
+    """Selective downscaling (SHY hypothesis).
+
+    Synapses that were recently active (high co-activity or tagged)
+    are protected. Inactive synapses get downscaled. Consolidated
+    (instinct) edges are exempt.
+
+    Uses ema_rate co-activity when available (works without Teacher
+    rewards), falls back to tag-only gating for backward compat.
+    """
     n = net._edge_count
     if n == 0:
         return
     tags = net._edge_tag[:n]
-    untagged = tags < tag_threshold
-    net._edge_w[:n][untagged] *= downscale
+    cons = net._edge_consolidation[:n]
+
+    # Protected = tagged OR consolidated OR actively carrying signal
+    protected = (tags >= tag_threshold) | (cons >= 1.0)
+
+    if ema_rate is not None:
+        src_rate = ema_rate[net._edge_src[:n]]
+        dst_rate = ema_rate[net._edge_dst[:n]]
+        co_activity = np.sqrt(src_rate * dst_rate) / max(target_rate, 1e-6)
+        # Scale downscaling by inactivity: active edges get less downscaling
+        # co_activity ~1.0 → scale ≈ 1.0 (no downscale)
+        # co_activity ~0.0 → scale = downscale (full downscale)
+        scale = np.where(
+            protected, 1.0,
+            downscale + (1.0 - downscale) * np.minimum(co_activity, 1.0),
+        )
+        w = net._edge_w[:n]
+        new_w = w * scale
+        pos = w > 0
+        neg = w < 0
+        new_w[pos] = np.maximum(new_w[pos], 1e-7)
+        new_w[neg] = np.minimum(new_w[neg], -1e-7)
+        net._edge_w[:n] = new_w
+    else:
+        untagged = ~protected
+        net._edge_w[:n][untagged] *= downscale
+
     net._edge_tag[:n] = 0.0
     net._csr_dirty = True
 
 
-def prune_sustained(
+def update_edge_health(
     net: DNG,
-    weak_threshold: float = 0.01,
-    cycles_required: int = 5,
-) -> int:
-    """Remove edges weak for multiple consecutive sleep cycles."""
+    decay_rate: float = 0.01,
+    ema_rate: np.ndarray | None = None,
+    target_rate: float = 0.15,
+) -> None:
+    """
+    Update per-synapse health each sleep cycle. Biological model:
+    inactive synapses lose structural proteins and shrink; active
+    ones get maintained by activity-dependent trophic signaling.
+
+    Activity is measured via neuron-level firing rate EMA (ema_rate)
+    rather than per-edge eligibility traces, which decay too fast
+    (0.85/step) to survive until sleep. A synapse is "active" if
+    both its pre and post neurons have been firing.
+
+    Falls back to eligibility + tag if ema_rate is not provided
+    (backward compat for non-Brain callers).
+    """
+    n = net._edge_count
+    if n == 0:
+        return
+
+    cons = net._edge_consolidation[:n]
+    health = net._edge_health[:n]
+
+    if ema_rate is not None:
+        src_rate = ema_rate[net._edge_src[:n]]
+        dst_rate = ema_rate[net._edge_dst[:n]]
+        co_activity = np.sqrt(src_rate * dst_rate) / max(target_rate, 1e-6)
+        np.minimum(co_activity, 1.0, out=co_activity)
+        activity_factor = co_activity
+    else:
+        elig = net._edge_eligibility[:n]
+        tag = net._edge_tag[:n]
+        activity_factor = np.minimum(1.0, elig + tag)
+
+    health -= decay_rate * (1.0 - activity_factor)
+
+    boost_mask = activity_factor > 0.3
+    health[boost_mask] += 0.05 * activity_factor[boost_mask]
+    np.minimum(health, 1.0, out=health)
+
+    cons_floor = cons / 20.0
+    np.maximum(health, cons_floor, out=health)
+
+    net._edge_health[:n] = health
+
+
+def prune_sustained(net: DNG, **kwargs) -> int:
+    """
+    Health-based pruning: remove edges whose health has decayed to zero.
+    Each synapse dies on its own timeline based on its individual activity
+    history — no synchronized counters, no cliff-edge mass extinction.
+    """
     n = net._edge_count
     if n == 0:
         return 0
-    w = net._edge_w[:n]
-    is_weak = np.abs(w) < weak_threshold
-    net._edge_weak_count[:n][is_weak] += 1
-    net._edge_weak_count[:n][~is_weak] = 0
-    to_remove = net._edge_weak_count[:n] >= cycles_required
+
+    to_remove = net._edge_health[:n] <= 0.0
     n_pruned = int(np.sum(to_remove))
     if n_pruned > 0:
         net._edge_w[:n][to_remove] = 0.0
@@ -240,10 +323,33 @@ def prune_sustained(
 def synaptogenesis(
     net: DNG,
     growth_rate: float = 0.3,
-    n_candidates: int = 5000,
+    n_candidates: int = 5_000,
+    activity_ema: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
 ) -> int:
-    """Grow new edges between co-active unconnected node pairs."""
+    """
+    Co-activity based synaptogenesis: fire together, wire together.
+
+    The same universal rule produces different connectivity patterns in
+    different pathways because the *input statistics* differ:
+    - Sensory->internal: spatially correlated inputs -> topographic maps
+    - Internal->internal: co-represented concepts -> associative connections
+    - Internal->motor: task-relevant mappings -> action circuits
+
+    Growth is gated by ACh (high during development, low in adulthood).
+    New synapses start as "silent synapses" — structurally present but
+    functionally very weak, requiring competitive Hebbian LTP to mature.
+
+    Biological basis:
+    - Hebb (1949): correlated activity drives synapse formation
+    - Bhatt et al (2009): LTP induces new dendritic spine formation
+    - Kwon & Bhatt (2022, Nat Neurosci): new spines form near potentiated
+      spines, connecting to previously unrepresented axons
+
+    At our scale (~4000 neurons), we sample co-active pairs directly rather
+    than modeling filopodia spatial search — the computational result (co-active
+    neurons get connected) is identical.
+    """
     if rng is None:
         rng = np.random.default_rng()
     if growth_rate <= 0 or net.ach < 0.01:
@@ -251,15 +357,20 @@ def synaptogenesis(
 
     from .graph import Region
     region_list = list(Region)
+    sensory_idx = region_list.index(Region.SENSORY)
     motor_idx = region_list.index(Region.MOTOR)
 
-    active_mask = net.r > 0.02
+    # Use EMA rates for stable activity signal, fall back to instantaneous
+    activity = activity_ema if activity_ema is not None else net.r
+
+    active_mask = activity > 0.02
     active_idx = np.where(active_mask)[0]
     n_active = len(active_idx)
 
     if n_active < 2:
         return 0
 
+    # Co-active pairs (main) + small exploratory fraction (ACh-gated)
     explore_frac = 0.2 * net.ach
     n_explore = int(n_candidates * explore_frac)
     n_coactive = n_candidates - n_explore
@@ -268,53 +379,76 @@ def synaptogenesis(
     src_active = active_idx[rng.integers(0, n_active, size=n_cand_active)]
     dst_active = active_idx[rng.integers(0, n_active, size=n_cand_active)]
 
-    all_idx = np.arange(net.n_nodes)
-    src_explore = all_idx[rng.integers(0, net.n_nodes, size=n_explore)]
-    dst_explore = all_idx[rng.integers(0, net.n_nodes, size=n_explore)]
+    src_explore = rng.integers(0, net.n_nodes, size=n_explore)
+    dst_explore = rng.integers(0, net.n_nodes, size=n_explore)
 
-    src_samples = np.concatenate([src_active, src_explore])
-    dst_samples = np.concatenate([dst_active, dst_explore])
+    src_all = np.concatenate([src_active, src_explore])
+    dst_all = np.concatenate([dst_active, dst_explore])
 
-    # No self-loops, no edges FROM motor (motor is output only)
+    # Biological constraints: no self-loops, no edges TO sensory, no edges FROM motor
     valid = (
-        (src_samples != dst_samples) &
-        (net.regions[src_samples] != motor_idx)
+        (src_all != dst_all)
+        & (net.regions[dst_all] != sensory_idx)
+        & (net.regions[src_all] != motor_idx)
     )
-    src_samples = src_samples[valid]
-    dst_samples = dst_samples[valid]
+    src_all = src_all[valid]
+    dst_all = dst_all[valid]
 
-    if len(src_samples) == 0:
+    if len(src_all) == 0:
         return 0
 
+    # Deduplicate against existing edges (vectorized)
     n_nodes = net.n_nodes
     n_existing = net._edge_count
-    existing_set = set(
-        (net._edge_src[:n_existing].astype(np.int64) * n_nodes
-         + net._edge_dst[:n_existing].astype(np.int64)).tolist()
+    edge_exists = np.zeros(n_nodes * n_nodes, dtype=np.bool_)
+    existing_hash = (
+        net._edge_src[:n_existing].astype(np.int64) * n_nodes
+        + net._edge_dst[:n_existing].astype(np.int64)
     )
-    candidate_hash = (src_samples.astype(np.int64) * n_nodes
-                      + dst_samples.astype(np.int64))
-    novel_mask = np.array([h not in existing_set for h in candidate_hash.tolist()],
-                          dtype=bool)
-    src_samples = src_samples[novel_mask]
-    dst_samples = dst_samples[novel_mask]
+    edge_exists[existing_hash] = True
+    cand_hash = src_all.astype(np.int64) * n_nodes + dst_all.astype(np.int64)
+    novel = ~edge_exists[cand_hash]
+    src_all = src_all[novel]
+    dst_all = dst_all[novel]
 
-    if len(src_samples) == 0:
+    if len(src_all) == 0:
         return 0
 
-    coact = net.r[src_samples] * net.r[dst_samples]
+    # Deduplicate within batch
+    cand_hash = src_all.astype(np.int64) * n_nodes + dst_all.astype(np.int64)
+    _, unique_idx = np.unique(cand_hash, return_index=True)
+    src_all = src_all[unique_idx]
+    dst_all = dst_all[unique_idx]
+
+    # Acceptance: co-activation driven + tiny exploratory baseline
+    coact = activity[src_all] * activity[dst_all]
     baseline_p = 0.001 * net.ach
     prob = growth_rate * net.ach * coact + baseline_p
-    np.clip(prob, 0.0, 1.0, out=prob)
-    rolls = rng.random(len(prob))
-    winners = rolls < prob
 
-    new_src = src_samples[winners]
-    new_dst = dst_samples[winners]
+    # Layer-distance decay: connections between distant cortical layers
+    # are physically harder to form (longer axons, white matter tracts).
+    # Same layer: 1.0x, adjacent: 0.3x, skip: 0.05x
+    _LAYER_DISTANCE_SCALE = {0: 1.0, 1: 0.3, 2: 0.05}
+    src_layers = np.array([layer_index(int(r)) for r in net.regions[src_all]])
+    dst_layers = np.array([layer_index(int(r)) for r in net.regions[dst_all]])
+    both_cortical = (src_layers >= 0) & (dst_layers >= 0)
+    layer_dist = np.abs(src_layers - dst_layers)
+    distance_scale = np.ones(len(prob))
+    for dist, scale in _LAYER_DISTANCE_SCALE.items():
+        distance_scale[both_cortical & (layer_dist == dist)] = scale
+    distance_scale[both_cortical & (layer_dist > 2)] = 0.01
+    prob *= distance_scale
+
+    np.clip(prob, 0.0, 1.0, out=prob)
+    winners = rng.random(len(prob)) < prob
+
+    new_src = src_all[winners]
+    new_dst = dst_all[winners]
 
     if len(new_src) == 0:
         return 0
 
+    # Silent synapses: weight scaled by co-activation strength
     new_coact = coact[winners]
     base_weight = 0.001 + 0.004 * (new_coact / (new_coact.max() + 1e-8))
     is_inhib = net.node_types[new_src] == _NTYPE_I
@@ -323,3 +457,104 @@ def synaptogenesis(
 
     net.add_edges_batch(new_src, new_dst, weights)
     return len(new_src)
+
+
+# ── Lateral decorrelation ────────────────────────────────────────
+
+def lateral_decorrelation(
+    net: DNG,
+    layer_neurons: np.ndarray,
+    eta: float = 0.005,
+    sim_threshold: float = 0.5,
+) -> int:
+    """
+    Anti-Hebbian lateral decorrelation for a cortical layer.
+
+    Biological basis: PV+ basket cell interneurons strengthen inhibitory
+    connections between co-active excitatory neurons, forcing them to
+    develop different feature selectivities. This is the primary cortical
+    mechanism preventing representational collapse (mode collapse) in
+    topographic maps.
+
+    For neurons that won WTA (r > 0.01), compute cosine similarity of
+    incoming excitatory weight vectors. Apply repulsive updates to
+    similar pairs, pushing their weight vectors apart on the hypersphere.
+
+    References:
+      - Földiák (1990): anti-Hebbian lateral connections for decorrelation
+      - Rubner & Schulten (1990): decorrelation via inhibitory feedback
+      - King et al (2013): PV+ interneurons shape feature selectivity in V1
+    """
+    ne = net._edge_count
+    if ne == 0:
+        return 0
+
+    active_mask = net.r[layer_neurons] > 0.01
+    active = layer_neurons[active_mask]
+    n_active = len(active)
+    if n_active < 2:
+        return 0
+
+    edge_src = net._edge_src[:ne]
+    edge_dst = net._edge_dst[:ne]
+    edge_w = net._edge_w[:ne]
+
+    active_set = np.zeros(net.n_nodes, dtype=bool)
+    active_set[active] = True
+    active_map = np.full(net.n_nodes, -1, dtype=np.int64)
+    active_map[active] = np.arange(n_active, dtype=np.int64)
+
+    # Excitatory edges incoming to active neurons
+    emask = active_set[edge_dst] & (edge_w > 0)
+    e_indices = np.where(emask)[0]
+    if len(e_indices) < n_active:
+        return 0
+
+    _DBG = getattr(lateral_decorrelation, '_debug', False)
+    if _DBG:
+        print(f"      [decorr] n_active={n_active}, e_indices={len(e_indices)}", flush=True)
+
+    e_rows = active_map[edge_dst[e_indices]]
+    e_cols = edge_src[e_indices]
+    e_vals = edge_w[e_indices].copy()
+
+    # Map source nodes to dense column indices
+    unique_src = np.unique(e_cols)
+    src_map = np.full(net.n_nodes, -1, dtype=np.int64)
+    src_map[unique_src] = np.arange(len(unique_src), dtype=np.int64)
+    n_src = len(unique_src)
+
+    # Dense weight matrix (n_active x n_unique_src)
+    W = np.zeros((n_active, n_src), dtype=np.float64)
+    W[e_rows, src_map[e_cols]] = e_vals
+
+    # Cosine similarity
+    norms = np.linalg.norm(W, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    W_hat = W / norms
+
+    sim = W_hat @ W_hat.T
+    np.fill_diagonal(sim, 0.0)
+
+    # Repel only pairs above threshold
+    repel = np.where(sim > sim_threshold, sim, 0.0)
+    n_repelled = int(np.count_nonzero(repel))
+    if _DBG:
+        sim_upper = sim[np.triu_indices(n_active, k=1)]
+        print(f"      [decorr] sim: mean={sim_upper.mean():.3f} max={sim_upper.max():.3f} "
+              f">thresh={int((sim_upper > sim_threshold).sum())} n_repelled={n_repelled}", flush=True)
+    if n_repelled == 0:
+        return 0
+
+    # dW_i = -eta * sum_j(sim[i,j] * W_hat_j)
+    dW = -eta * (repel @ W_hat)
+    dW_mag = float(np.abs(dW).mean())
+    if dW_mag < 1e-10:
+        return 0
+
+    # Write back to edges
+    edge_w[e_indices] += dW[e_rows, src_map[e_cols]]
+    np.clip(edge_w[e_indices], 1e-7, None, out=edge_w[e_indices])
+
+    net._csr_dirty = True
+    return n_repelled

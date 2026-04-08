@@ -34,8 +34,6 @@ def _run_one_plastic_step(net, n_steps=1, DA=0.0, signal=None):
     noise = np.zeros((n_steps, n))
     edge_plastic = np.ones(max(ne, 1), dtype=numba_bool())
 
-    bcm_theta = np.full(n, 0.1, dtype=np.float64)
-
     # Refractory applies only to INTERNAL/MEMORY; use regions to build mask
     from src.graph import Region
     _reg = list(Region)
@@ -43,23 +41,33 @@ def _run_one_plastic_step(net, n_steps=1, DA=0.0, signal=None):
     mem_idx = _reg.index(Region.MEMORY)
     refractory_mask = (net.regions == int_idx) | (net.regions == mem_idx)
 
+    node_col_id = np.full(n, -1, dtype=np.int64)
+    col_mean_r = np.zeros(1, dtype=np.float64)
+
     run_steps_plastic(
         net.V, net.r, net.prev_r, net.f,
         net.threshold, net.leak_rates, net.excitability, net.adaptation,
         net._edge_src[:ne], net._edge_dst[:ne], net._edge_w[:ne], ne,
         net.inh_scale,
         signal, 0.0,
-        DA, 0.01, 5.0, bcm_theta, 0,
+        DA, 0.01, 5.0, 0,
         net.max_rate, 0.05, 0.02, 3.0,
         net.adapt_rate, 0.1,
-        np.array([], dtype=np.int64), 0,
+        np.array([], dtype=np.int64),
+        np.array([], dtype=np.int64),
+        np.array([], dtype=np.int64),
+        0, 0.5,
         np.array([], dtype=np.int64), 0,
         has_signal, n, n_steps,
         noise,
-        n, 0, 10,  # motor_start=n (past end), n_cells=0 -> no motor WTA
+        n, 0, 10,
         edge_plastic,
         net._edge_eligibility[:ne], 0.95,
         refractory_mask,
+        0.05,
+        np.zeros(n, dtype=np.float64),
+        node_col_id,
+        col_mean_r,
     )
 
 

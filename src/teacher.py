@@ -156,16 +156,69 @@ class Teacher:
         task = random.choice(tasks)
         return task_type, task
 
+    def _build_spotlight_signal(
+        self,
+        input_grid: np.ndarray,
+        output_grid: np.ndarray,
+        h: int, w: int,
+        strength: float = 1.5,
+    ) -> np.ndarray:
+        """
+        Build a sensory signal with attention spotlighting: cells that
+        CHANGE between input and output get boosted signal strength.
+        Like a parent pointing: "look HERE at what changed."
+        """
+        signal = grid_to_signal(input_grid, max_h=h, max_w=w)
+        if strength <= 1.0:
+            return signal
+
+        from .perception.encoder import FEATURES_PER_CELL
+        n_cells = h * w
+        for i in range(min(n_cells, input_grid.size, output_grid.size)):
+            r, c = divmod(i, w)
+            if r < input_grid.shape[0] and c < input_grid.shape[1]:
+                in_val = input_grid[r, c]
+            else:
+                in_val = 0
+            if r < output_grid.shape[0] and c < output_grid.shape[1]:
+                out_val = output_grid[r, c]
+            else:
+                out_val = 0
+            if in_val != out_val:
+                base = i * FEATURES_PER_CELL
+                end = base + FEATURES_PER_CELL
+                signal[base:end] *= strength
+        return signal
+
+    def _motor_signal_from_grid(self, grid: np.ndarray, h: int, w: int) -> np.ndarray:
+        """Encode an output grid as a motor teaching signal (one-hot per cell)."""
+        padded = pad_grid(grid, h, w)
+        n_cells = h * w
+        motor = np.zeros(n_cells * NUM_COLORS, dtype=np.float64)
+        for i in range(n_cells):
+            r, c = divmod(i, w)
+            color = int(padded[r, c])
+            motor[i * NUM_COLORS + color] = 1.0
+        return motor
+
     def run_task(self, task_type: str, task: dict) -> bool:
         """
         Present a single task to the brain.
 
-        The Teacher interacts through senses only:
-          - inject_signal: show something to the brain's eyes
-          - clear_signal: stop showing
-          - apply_reward: external reward/punishment (brain converts to DA internally)
+        Flow:
+          1. Demonstrations: show input+output pairs (brain sees the answer
+             being produced). Number of demos controlled by developmental stage.
+             Attention spotlight boosts cells that change.
+          2. Attempt: show new input only, brain produces its own output.
+             Capture free-phase correlations.
+          3. Reward: RPE delivered via apply_reward (the ONLY place Teacher
+             influences DA besides the implicit novelty from inject_signal).
+          4. Correction: if wrong, show correct answer, capture clamped
+             correlations, apply CHL error correction.
+          5. Rest: clear stimulus, spontaneous replay.
 
-        The Teacher NEVER directly sets DA or other brain internals.
+        DA is NOT set by the Teacher — it's computed automatically by the
+        brain's novelty detector (in inject_signal) and by RPE at reward.
         """
         h = self.brain.net.max_h
         w = self.brain.net.max_w
@@ -174,27 +227,43 @@ class Teacher:
         if not pairs:
             return False
 
-        pair = random.choice(pairs)
-        input_grid = np.array(pair["input"], dtype=np.int32)
-        expected_grid = np.array(pair["output"], dtype=np.int32)
+        # Developmental stage controls demo count and spotlight strength
+        sp = self.brain.stage_manager.current_setpoints()
+        n_demos = sp.n_demos
+        spotlight = sp.spotlight_strength
 
-        # Ensure grids fit the brain's max dimensions
-        input_grid = pad_grid(input_grid, h, w)
-        expected_grid = pad_grid(expected_grid, h, w)
+        # --- Phase 1: Demonstrations ---
+        # Show multiple input+output pairs so the brain sees the pattern
+        demo_pairs = pairs[:n_demos] if n_demos > 0 else []
+        for dp in demo_pairs:
+            dp_in = pad_grid(np.array(dp["input"], dtype=np.int32), h, w)
+            dp_out = pad_grid(np.array(dp["output"], dtype=np.int32), h, w)
+
+            sensory = self._build_spotlight_signal(dp_in, dp_out, h, w, spotlight)
+            motor = self._motor_signal_from_grid(dp_out, h, w)
+
+            self.brain.store_signal(sensory)
+            self.brain.inject_teaching_signal(sensory, motor)
+            self.brain.step(n_steps=self.observe_steps)
+            self.brain.clear_signal()
+            self.brain.step(n_steps=5)
+
+        # --- Phase 2: Attempt ---
+        # Pick a pair NOT used in demos for the test
+        remaining = [p for p in pairs if p not in demo_pairs]
+        test_pair = random.choice(remaining) if remaining else random.choice(pairs)
+        input_grid = pad_grid(np.array(test_pair["input"], dtype=np.int32), h, w)
+        expected_grid = pad_grid(np.array(test_pair["output"], dtype=np.int32), h, w)
         out_h, out_w = expected_grid.shape
 
-        # Phase 1: Show input — brain looks at the stimulus
         signal = grid_to_signal(input_grid, max_h=h, max_w=w)
         self.brain.store_signal(signal)
         self.brain.inject_signal(signal)
-        self.brain.step(n_steps=self.observe_steps)
 
-        # Phase 2: Attempt — brain produces output (input stays visible)
-        # Capture "free" correlations: what the brain does on its own
         free_corr = self.brain.snapshot_correlations(n_steps=self.attempt_steps)
         output_grid = self.brain.read_motor(out_h, out_w)
 
-        # Phase 3: Evaluate and reward
+        # --- Phase 3: Evaluate and reward ---
         correct = np.array_equal(output_grid, expected_grid)
         n_cells = out_h * out_w
         cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
@@ -206,22 +275,22 @@ class Teacher:
 
         mean_change = self.brain.apply_reward(reward)
 
-        # Phase 4: If wrong, show the correct answer and capture "clamped"
-        # correlations — what the brain does when seeing the right answer.
-        # CHL uses the difference to compute an error-corrective weight update.
+        # --- Phase 4: Correction (CHL) ---
         if not correct:
-            teach_signal = grid_to_signal(expected_grid, max_h=h, max_w=w)
-            self.brain.inject_signal(teach_signal)
+            teach_sensory = self._build_spotlight_signal(
+                input_grid, expected_grid, h, w, spotlight,
+            )
+            motor = self._motor_signal_from_grid(expected_grid, h, w)
+            self.brain.inject_teaching_signal(teach_sensory, motor)
             clamped_corr = self.brain.snapshot_correlations(
                 n_steps=self.observe_steps // 2,
             )
             chl_change = self.brain.apply_chl(free_corr, clamped_corr)
         else:
-            # Correct: clamped == free, store for replay but no CHL needed
             self.brain.store_replay(free_corr, free_corr)
             chl_change = 0.0
 
-        # Phase 5: Rest — clear stimulus, let activity settle, spontaneous replay
+        # --- Phase 5: Rest + spontaneous replay ---
         self.brain.clear_signal()
         self.brain.step(n_steps=10)
         self.brain.spontaneous_replay(n_steps=10, strength=0.2)
@@ -241,7 +310,6 @@ class Teacher:
         else:
             tracker.consecutive_solves = 0
 
-        # Check mastery
         if not tracker.mastered and tracker.consecutive_solves >= self.mastery_threshold:
             all_tasks = self._tasks_by_type.get(task_type, [])
             if tracker.solves >= len(all_tasks):
@@ -260,7 +328,7 @@ class Teacher:
             reward=reward,
             mean_change=mean_change,
             age=self.brain.age,
-            extra={"cell_accuracy": cell_acc},
+            extra={"cell_accuracy": cell_acc, "n_demos": len(demo_pairs)},
         )
 
         return correct

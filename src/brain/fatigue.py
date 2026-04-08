@@ -19,8 +19,8 @@ class FatigueTracker:
     threshold: float = 50.0
     sleep_reset: float = 0.1
 
-    def accumulate(self, mean_rate: float):
-        self.level += self.rate * mean_rate
+    def accumulate(self, mean_rate: float, n_steps: int = 1):
+        self.level += self.rate * mean_rate * n_steps
 
     def needs_sleep(self) -> bool:
         return self.level >= self.threshold

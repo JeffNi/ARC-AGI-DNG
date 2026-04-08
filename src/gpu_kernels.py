@@ -115,7 +115,7 @@ def gpu_run_steps_plastic(
     edge_src, edge_dst, edge_w, n_edges, inh_scale,
     csr_perm,
     signal, noise_scale,
-    DA, eta, w_max, bcm_theta, plasticity_interval,
+    DA, eta, w_max, plasticity_interval,
     max_rate, f_rate_eff, f_decay, f_max,
     adapt_rate, adapt_decay,
     pool_indices, wta_k,
@@ -124,9 +124,13 @@ def gpu_run_steps_plastic(
     noise_matrix,
     motor_start, n_motor_cells, n_colors,
     edge_plastic,
+    eta_local,
+    node_col_id,
+    col_sizes,
+    n_cols,
 ):
     """
-    GPU dynamics with continuous local plasticity.
+    GPU dynamics with competitive Hebbian plasticity.
 
     Uses CSR for cuSPARSE mat-vec, edge arrays for plasticity updates.
     After each plasticity pass, CSR data is rebuilt from edge weights
@@ -158,6 +162,7 @@ def gpu_run_steps_plastic(
     d_edge_w = cp.asarray(edge_w)
     d_edge_plastic = cp.asarray(edge_plastic)
     d_csr_perm = cp.asarray(csr_perm)
+    d_node_col_id = cp.asarray(node_col_id)
 
     one_minus_leak = 1.0 - d_leak
     one_minus_fdecay = 1.0 - f_decay
@@ -179,20 +184,37 @@ def gpu_run_steps_plastic(
         _wta_motor_gpu(d_r, motor_start, n_motor_cells, n_colors)
 
         if plasticity_interval > 0 and s > 0 and s % plasticity_interval == 0:
+            # Compute per-column mean post-WTA rate on GPU
+            d_col_mean = cp.zeros(max(n_cols, 1), dtype=cp.float64)
+            d_col_sizes_gpu = cp.asarray(col_sizes, dtype=cp.float64)
+            for c in range(n_cols):
+                col_mask = d_node_col_id == c
+                if cp.any(col_mask):
+                    d_col_mean[c] = cp.mean(d_r[col_mask])
+
+            post_wta = d_r[d_edge_dst]
             pre_r = d_r[d_edge_src]
-            post_r = d_r[d_edge_dst]
-            active = (pre_r > 0.01) & (post_r > 0.01) & d_edge_plastic
-            theta = cp.asarray(bcm_theta)[d_edge_dst]
-            dw = eta * DA * pre_r * (post_r - theta)
+            dst_col = d_node_col_id[d_edge_dst]
+            h_star = d_col_mean[cp.clip(dst_col, 0, max(n_cols - 1, 0))]
+            h_star = cp.where(dst_col >= 0, h_star, 0.0)
+
+            delta = post_wta - h_star
+            g_h = cp.where(delta > 0.0, delta * delta, 0.0)
+
+            w_abs = cp.abs(d_edge_w)
+            # Contrastive K-H rule: pull weight toward input
+            dw = eta_local * g_h * (pre_r - w_abs)
+            dw += eta * DA * g_h * pre_r
             dw = cp.where(d_edge_w < 0.0, -dw, dw)
+            active = ((pre_r > 0.001) | (post_wta > 0.001)) & d_edge_plastic
             dw = cp.where(active, dw, 0.0)
             d_edge_w += dw
+
             pos = d_edge_w > 0.0
             neg = d_edge_w < 0.0
             d_edge_w = cp.where(pos, cp.clip(d_edge_w, _EPS, w_max), d_edge_w)
             d_edge_w = cp.where(neg, cp.clip(d_edge_w, -w_max, -_EPS), d_edge_w)
 
-            # Sync CSR data from edge weights
             scaled = cp.where(d_edge_w < 0.0, d_edge_w * inh_scale, d_edge_w)
             W_gpu.data[:] = scaled[d_csr_perm]
 

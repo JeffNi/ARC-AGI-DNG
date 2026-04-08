@@ -142,7 +142,7 @@ class TestEdgeCases:
     def test_1x1_grid(self):
         grid = np.array([[3]])
         feat = compute_local_features(grid)
-        assert feat.shape == (1, 1, 28)
+        assert feat.shape == (1, 1, 30)
         assert feat[0, 0, 3] == 1.0  # color 3
         assert np.all(feat[0, 0, 10:18] == 0.0)  # no neighbors
         assert feat[0, 0, 26] == 1.0  # border
@@ -151,7 +151,7 @@ class TestEdgeCases:
     def test_1xN_grid(self):
         grid = np.array([[0, 1, 0]])
         feat = compute_local_features(grid)
-        assert feat.shape == (1, 3, 28)
+        assert feat.shape == (1, 3, 30)
         # Middle cell: left/right neighbors exist
         assert feat[0, 1, 12] == 1.0  # left neighbor differs
         assert feat[0, 1, 13] == 1.0  # right neighbor differs
@@ -159,14 +159,14 @@ class TestEdgeCases:
     def test_Nx1_grid(self):
         grid = np.array([[0], [1], [0]])
         feat = compute_local_features(grid)
-        assert feat.shape == (3, 1, 28)
+        assert feat.shape == (3, 1, 30)
         assert feat[1, 0, 10] == 1.0  # up differs
         assert feat[1, 0, 11] == 1.0  # down differs
 
     def test_all_10_colors(self):
         grid = np.arange(10).reshape(2, 5)
         feat = compute_local_features(grid)
-        assert feat.shape == (2, 5, 28)
+        assert feat.shape == (2, 5, 30)
         for i in range(10):
             r, c = divmod(i, 5)
             assert np.sum(feat[r, c, :10]) == 1.0

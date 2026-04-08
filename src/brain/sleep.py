@@ -17,6 +17,7 @@ import numpy as np
 from ..graph import DNG
 from ..plasticity import (
     sleep_selective,
+    update_edge_health,
     prune_sustained,
     contrastive_hebbian_update,
 )
@@ -30,8 +31,9 @@ def nrem_sleep(
     n_replay: int = 5,
     shy_downscale: float = 0.97,
     tag_threshold: float = 0.01,
-    prune_threshold: float = 0.005,
-    prune_cycles: int = 5,
+    health_decay_rate: float = 0.01,
+    ema_rate: np.ndarray | None = None,
+    target_rate: float = 0.15,
     **kwargs,
 ) -> dict:
     """
@@ -48,12 +50,17 @@ def nrem_sleep(
         contrastive_hebbian_update(net, free_corr, clamped_corr, eta=chl_eta)
         stats["replays"] += 1
 
-    # SHY: selective downscaling of untagged synapses
-    sleep_selective(net, downscale=shy_downscale, tag_threshold=tag_threshold)
-
-    # Pruning
-    stats["pruned"] = prune_sustained(
-        net, weak_threshold=prune_threshold, cycles_required=prune_cycles
+    # SHY: selective downscaling — active edges protected, inactive downscaled
+    sleep_selective(
+        net, downscale=shy_downscale, tag_threshold=tag_threshold,
+        ema_rate=ema_rate, target_rate=target_rate,
     )
+
+    # Health decay then health-based pruning
+    update_edge_health(
+        net, decay_rate=health_decay_rate,
+        ema_rate=ema_rate, target_rate=target_rate,
+    )
+    stats["pruned"] = prune_sustained(net)
 
     return stats

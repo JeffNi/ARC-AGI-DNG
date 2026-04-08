@@ -24,6 +24,13 @@ class Genome:
     frac_modulatory: float = 0.05
     frac_memory: float = 0.1
 
+    # ── Cortical layer fractions (of n_internal) ──────────────────────
+    # Bottom-heavy hierarchy mirrors biology: most neurons in early
+    # visual areas, fewer in association/abstract areas.
+    frac_layer1: float = 0.60   # Local feature combination (V4-like)
+    frac_layer2: float = 0.25   # Regional integration (IT-like)
+    frac_layer3: float = 0.15   # Abstract / reasoning (PFC-like)
+
     # ── Long-term memory pool ─────────────────────────────────────────
     n_memory: int = 100
 
@@ -46,7 +53,7 @@ class Genome:
     max_fan_in: int = 150
 
     # ── Weight initialization ─────────────────────────────────────────
-    weight_scale: float = 0.002
+    weight_scale: float = 0.03
 
     # ── Facilitation parameters ───────────────────────────────────────
     f_rate: float = 0.05
@@ -69,7 +76,7 @@ class Genome:
     # ── Dynamics / WTA ───────────────────────────────────────────────
     noise_std: float = 0.01
     plasticity_interval: int = 5
-    wta_k: int = 20
+    wta_k: int = 60
 
     # ── Homeostasis ───────────────────────────────────────────────────
     homeostasis_interval: int = 50
@@ -78,6 +85,7 @@ class Genome:
     chl_eta: float = 0.01
     elig_eta: float = 0.2
     elig_decay: float = 0.85
+    eta_local: float = 0.005      # DA-independent Hebbian rate (NMDA-like, always on)
 
     # ── DA parameters ──────────────────────────────────────────────────
     da_baseline_obs: float = 0.2
@@ -114,6 +122,15 @@ class Genome:
         g.frac_inhibitory = _perturb_float(g.frac_inhibitory, 0.0, 0.5)
         g.frac_modulatory = _perturb_float(g.frac_modulatory, 0.0, 0.3)
         g.frac_memory = _perturb_float(g.frac_memory, 0.0, 0.5)
+
+        # Perturb layer fractions then renormalize to sum to 1
+        g.frac_layer1 = _perturb_float(g.frac_layer1, 0.2, 0.8)
+        g.frac_layer2 = _perturb_float(g.frac_layer2, 0.1, 0.5)
+        g.frac_layer3 = _perturb_float(g.frac_layer3, 0.05, 0.4)
+        layer_sum = g.frac_layer1 + g.frac_layer2 + g.frac_layer3
+        g.frac_layer1 /= layer_sum
+        g.frac_layer2 /= layer_sum
+        g.frac_layer3 /= layer_sum
 
         for attr in ['density_sensory_to_internal', 'density_internal_to_motor',
                       'density_internal_to_internal', 'density_motor_to_internal',

@@ -15,8 +15,9 @@ from .objects import compute_object_features, _connected_components
 from .global_features import compute_global_features
 
 # Per-cell: 10 one-hot + 4 ortho boundary + 4 diag boundary
-#         + 8 object features + 1 border flag + 1 neighbor fraction = 28
-FEATURES_PER_CELL = 28
+#         + 8 object features + 1 border flag + 1 neighbor fraction
+#         + 2 position encoding (row, col) = 30
+FEATURES_PER_CELL = 30
 
 # Global features: 28 (histogram + bg + symmetry + stats)
 GLOBAL_FEATURES = 28
@@ -30,13 +31,15 @@ def perceive(grid: np.ndarray) -> np.ndarray:
 
     Layout:
       For cell (r, c) at flat index i = r * w + c:
-        signal[i * 28 : i * 28 + 10]  = one-hot color
-        signal[i * 28 + 10 : i * 28 + 14] = ortho boundary
-        signal[i * 28 + 14 : i * 28 + 18] = diag boundary
-        signal[i * 28 + 18 : i * 28 + 26] = object features
-        signal[i * 28 + 26] = border flag
-        signal[i * 28 + 27] = same-color neighbor fraction
-      signal[h*w*28 : h*w*28 + 28] = global features
+        signal[i * 30 : i * 30 + 10]  = one-hot color
+        signal[i * 30 + 10 : i * 30 + 14] = ortho boundary
+        signal[i * 30 + 14 : i * 30 + 18] = diag boundary
+        signal[i * 30 + 18 : i * 30 + 26] = object features
+        signal[i * 30 + 26] = border flag
+        signal[i * 30 + 27] = same-color neighbor fraction
+        signal[i * 30 + 28] = normalized row position
+        signal[i * 30 + 29] = normalized column position
+      signal[h*w*30 : h*w*30 + 28] = global features
     """
     grid = np.asarray(grid, dtype=np.int32)
     h, w = grid.shape

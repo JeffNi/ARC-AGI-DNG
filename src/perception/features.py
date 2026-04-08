@@ -24,7 +24,7 @@ def compute_local_features(grid: np.ndarray) -> np.ndarray:
     """
     Compute per-cell local features from a raw ARC grid.
 
-    For each cell, produces a vector of length 28:
+    For each cell, produces a vector of length 30:
       [0:10]  - one-hot color encoding
       [10:14] - orthogonal boundary signals (1.0 if neighbor differs)
       [14:18] - diagonal boundary signals (1.0 if neighbor differs)
@@ -32,13 +32,15 @@ def compute_local_features(grid: np.ndarray) -> np.ndarray:
       [22:26] - reserved for object features (filled by objects.py)
       [26]    - border flag (1.0 if cell is on grid edge)
       [27]    - same-color orthogonal neighbor fraction
+      [28]    - normalized row position (0.0 = top, 1.0 = bottom)
+      [29]    - normalized column position (0.0 = left, 1.0 = right)
 
     Returns:
-        np.ndarray of shape (h, w, 28) with values in [0, 1].
+        np.ndarray of shape (h, w, 30) with values in [0, 1].
     """
     grid = np.asarray(grid, dtype=np.int32)
     h, w = grid.shape
-    features = np.zeros((h, w, 28), dtype=np.float64)
+    features = np.zeros((h, w, 30), dtype=np.float64)
 
     # One-hot color encoding [0:10]
     for r in range(h):
@@ -86,5 +88,11 @@ def compute_local_features(grid: np.ndarray) -> np.ndarray:
                     if grid[nr, nc] == color:
                         n_same += 1
             features[r, c, 27] = n_same / max(n_neighbors, 1)
+
+    # Retinotopic position encoding [28:30]
+    for r in range(h):
+        for c in range(w):
+            features[r, c, 28] = r / max(h - 1, 1)
+            features[r, c, 29] = c / max(w - 1, 1)
 
     return features
