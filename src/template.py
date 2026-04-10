@@ -176,6 +176,24 @@ def create_dng(
         connection_prob=rf_prob,
     )
 
+    # L1 -> MOTOR: topographic output from local features.
+    # In cortex, primary sensory areas can drive motor output directly
+    # (e.g. V1->superior colliculus for saccades). Starts as silent
+    # synapses — CHL teaches the correct mapping during childhood.
+    _inter_layer_rf_edges(
+        net, layer1, motor, grid_h, grid_w, n_cells,
+        rf_radius=2, connection_prob=0.10,
+        ws=ws * 0.01, rng=rng,
+    )
+
+    # L2 -> MOTOR: topographic output from mid-level features.
+    # Wider RF since L2 encodes broader spatial patterns.
+    _inter_layer_rf_edges(
+        net, layer2, motor, grid_h, grid_w, n_cells,
+        rf_radius=3, connection_prob=0.10,
+        ws=ws * 0.01, rng=rng,
+    )
+
     # ═══════════════════════════════════════════════════════════════════
     # FEEDBACK PATHWAY (weak at birth, ~10% of feedforward)
     # ═══════════════════════════════════════════════════════════════════
@@ -215,9 +233,11 @@ def create_dng(
     fan_l1_s = _fan_in(genome.density_internal_to_sensory, n_l1, cap)
     _fan_in_edges(net, layer1, sensory, fan_l1_s, lateral_ws, rng)
 
-    # SENSORY -> MOTOR: weak direct path (NOT the copy pathway)
+    # SENSORY -> MOTOR: diffuse background path (NOT the copy pathway).
+    # Kept very weak so the copy pathway dominates instinctive motor output.
+    # These can strengthen through learning if needed.
     fan_s2m = _fan_in(genome.density_sensory_to_motor, n_sensory, cap)
-    _fan_in_edges(net, sensory, motor, fan_s2m, ws, rng)
+    _fan_in_edges(net, sensory, motor, fan_s2m, ws * 0.1, rng)
 
     # MEMORY circuit — wired to Layer 3 (abstract/reasoning)
     # Memory self-connections are strong (bistable attractors).
@@ -228,10 +248,12 @@ def create_dng(
     _fan_in_edges(net, memory, memory, mem_fan_in, mem_ws, rng)
     _fan_in_edges(net, layer3, memory, min(max(10, n_l3 // 3), cap), ws * 2, rng)
     _fan_in_edges(net, memory, layer3, min(max(10, n_mem // 2), cap), ws * 2, rng)
-    _fan_in_edges(net, memory, motor, min(max(10, n_mem // 2), cap), ws * 2, rng)
+    _fan_in_edges(net, memory, motor, min(max(10, n_mem // 2), cap), ws * 0.2, rng)
     _fan_in_edges(net, sensory, memory, min(max(5, n_sensory // 15), cap), ws, rng)
 
     # INSTINCT: Copy pathway — sensory COLOR nodes -> motor nodes (1:1)
+    # Brainstem reflex: strong, consolidated, re-pinned every step.
+    # Decays as copy_strength drops during development.
     copy_src = []
     copy_dst = []
     for cell in range(n_cells):
@@ -242,11 +264,18 @@ def create_dng(
             copy_dst.append(m_idx)
     copy_src = np.array(copy_src, dtype=np.int32)
     copy_dst = np.array(copy_dst, dtype=np.int32)
-    copy_w = np.full(len(copy_src), 2.0)
+    copy_w = np.full(len(copy_src), 5.0)
     edge_start = net._edge_count
     net.add_edges_batch(copy_src, copy_dst, copy_w)
     edge_end = net._edge_count
     net._edge_consolidation[edge_start:edge_end] = 20.0
+
+    # LEARNABLE COPY: same 1:1 color topology, weak initial weights.
+    # Cortical motor pathway: starts silent, strengthened by mimicry
+    # reward during late infancy. Takes over from the instinct pathway
+    # as copy_strength decays in childhood.
+    learn_w = np.full(len(copy_src), ws * 0.5)
+    net.add_edges_batch(copy_src, copy_dst, learn_w)
 
     # Spatial neighbor connections for motor
     _spatial_neighbors(net, motor_start, grid_h, grid_w,

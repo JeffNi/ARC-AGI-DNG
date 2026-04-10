@@ -34,6 +34,7 @@ def nrem_sleep(
     health_decay_rate: float = 0.01,
     ema_rate: np.ndarray | None = None,
     target_rate: float = 0.15,
+    w_max: float = 5.0,
     **kwargs,
 ) -> dict:
     """
@@ -47,7 +48,8 @@ def nrem_sleep(
     n_to_replay = min(n_replay, len(replay_buffer))
     for i in range(n_to_replay):
         free_corr, clamped_corr = replay_buffer[-(i + 1)]
-        contrastive_hebbian_update(net, free_corr, clamped_corr, eta=chl_eta)
+        contrastive_hebbian_update(net, free_corr, clamped_corr, eta=chl_eta,
+                                   w_max=w_max)
         stats["replays"] += 1
 
     # SHY: selective downscaling — active edges protected, inactive downscaled

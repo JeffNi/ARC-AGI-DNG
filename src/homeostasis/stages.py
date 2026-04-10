@@ -4,9 +4,15 @@ Developmental stages — setpoint configurations and smooth transitions.
 Homeostasis is the same code at every stage; only the parameters change.
 StageManager handles scheduling transitions and producing the current
 blended HomeostasisSetpoints.
+
+Transitions use exponential approach (1 - e^{-t/tau}) rather than linear
+ramps, matching the biological time-constant model of developmental
+parameter change (Huttenlocher & Dabholkar 1997; Petanjek et al 2011).
 """
 
 from __future__ import annotations
+
+import math
 
 from .setpoints import HomeostasisSetpoints
 
@@ -24,7 +30,7 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         ei_target_ratio=0.6,
         ema_tau=0.02,                    # moderate EMA: responsive but not twitchy
         # Developmental — genetic clock
-        synaptogenesis_rate=0.3,         # acceptance prob for neurotrophin pool
+        synaptogenesis_rate=0.5,         # exuberant growth — overproduction then prune
         synaptogenesis_candidates=50_000,   # per-step candidate pairs (continuous growth)
         health_decay_rate=0.01,          # gentle pruning pressure even in infancy
         da_baseline=0.03,                # low resting DA
@@ -36,27 +42,60 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         fatigue_threshold=10.0,          # frequent sleep (like a newborn)
         wta_active_frac=0.3,            # starts broad (PV+ immature), ramped to 0.1 by run_infancy
         noise_std=0.05,                 # spontaneous activity: enough to fire, not enough to drown signal
+        task_mix_ratio=0.0,             # pure unsupervised stimuli
+        copy_strength=1.0,              # full instinct — copy pathway at birth weight
+    ),
+    "late_infancy": HomeostasisSetpoints(
+        # Motor babbling and mimicry phase.  L1 is stable; the baby can
+        # now "see" and starts learning motor control through exploration
+        # and imitating the copy pathway.  Synaptogenesis slows — the brain
+        # shifts from growing connections to learning how to use them.
+        target_rate=0.25,
+        scaling_gain=0.0,
+        intrinsic_eta=0.0,
+        ei_target_ratio=0.6,
+        ema_tau=0.02,
+        # Developmental
+        synaptogenesis_rate=0.25,        # slowing — refine, don't grow
+        synaptogenesis_candidates=20_000,
+        health_decay_rate=0.02,
+        da_baseline=0.03,
+        da_sensitivity=0.4,              # slightly higher novelty response for motor exploration
+        plasticity_rate=0.5,
+        leak_rate_target=0.18,
+        n_demos=3,
+        spotlight_strength=2.0,
+        fatigue_threshold=10.0,
+        wta_active_frac=0.15,           # tighter competition than early infancy
+        noise_std=0.05,
+        task_mix_ratio=0.0,             # no formal tasks yet
+        babble_ratio=0.4,               # 40% motor activities — L1 still needs its normal sensory diet
+        copy_strength=1.0,              # full strength — it IS the desire to imitate
     ),
     "childhood": HomeostasisSetpoints(
-        # Homeostatic (sleep-only application)
+        # Identity should already work from mimicry training.
+        # Copy pathway begins gradual decay; tasks test learned pathways.
         target_rate=0.15,
-        scaling_gain=0.025,
-        intrinsic_eta=0.01,
+        scaling_gain=0.0,                # DISABLED — L2/L3 still differentiating, scaling fights that
+        intrinsic_eta=0.0,               # DISABLED — re-enable in adolescence when representations consolidate
         ei_target_ratio=0.8,
         ema_tau=0.02,
         # Developmental
-        synaptogenesis_rate=0.15,        # slowing growth
-        synaptogenesis_candidates=2_000,   # per-step candidate pairs
+        synaptogenesis_rate=0.15,        # slowing growth (exponential decline from infancy peak)
+        synaptogenesis_candidates=10_000,  # enough for L2/L3 cross-layer wiring
         health_decay_rate=0.05,          # activity-dependent sculpting
         da_baseline=0.05,                # increasing DA tone
         da_sensitivity=0.5,              # stronger novelty response
-        plasticity_rate=1.0,             # baseline learning rate
+        plasticity_rate=1.0,             # elevated learning rate
         leak_rate_target=0.12,           # partial myelination
         n_demos=2,                       # less scaffolding
         spotlight_strength=1.5,          # moderate attention guidance
         fatigue_threshold=10.0,          # longer wake periods
-        wta_active_frac=0.2,            # E/I balance maturing — lateral inhibition sharpens
+        wta_active_frac=0.12,           # slight loosening from infancy 0.1, not 0.2 which undoes L1
         noise_std=0.05,                 # moderate spontaneous activity
+        task_mix_ratio=0.7,             # mostly supervised tasks, 30% stimuli continues
+        babble_ratio=0.1,               # some continued mimicry alongside tasks
+        copy_strength=0.5,              # decaying — sensory→motor pathway learned identity during mimicry
     ),
     "adolescence": HomeostasisSetpoints(
         # Homeostatic (sleep-only application)
@@ -78,28 +117,36 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         fatigue_threshold=15.0,          # adult sleep pattern
         wta_active_frac=0.1,            # tight adult E/I balance
         noise_std=0.02,                 # low spontaneous activity (adult cortex)
+        task_mix_ratio=1.0,             # fully supervised
+        copy_strength=0.8,              # slight decay — cortical pathways beginning to modulate instinct
     ),
 }
 
 
 class StageManager:
     """
-    Manages developmental stage transitions with smooth interpolation.
+    Manages developmental stage transitions with exponential approach.
 
-    Transitions never snap — setpoints are linearly interpolated over
-    `transition_steps` brain steps.
+    Biological basis: developmental parameters change with exponential
+    time constants (Huttenlocher & Dabholkar 1997). Synaptogenesis rate
+    declines as 1 - e^{-t/tau}, not linearly. This means rapid initial
+    change (the system quickly leaves the old state) with a long tail
+    (it gradually and asymptotically approaches the new state).
+
+    `transition_tau` controls the time constant in brain steps. At 3*tau,
+    the transition is ~95% complete. We cap at 99.5% and snap to target.
     """
 
     def __init__(
         self,
         initial_stage: str = "infancy",
-        transition_steps: int = 5000,
+        transition_tau: int = 10_000,
     ):
         if initial_stage not in STAGES:
             raise ValueError(f"Unknown stage: {initial_stage}. Choose from {list(STAGES.keys())}")
 
         self.current_stage = initial_stage
-        self.transition_steps = transition_steps
+        self.transition_tau = transition_tau
 
         self._from_setpoints = STAGES[initial_stage]
         self._to_setpoints = STAGES[initial_stage]
@@ -117,13 +164,14 @@ class StageManager:
         self._steps_in_transition = 0
         self.current_stage = stage
 
-    def step(self):
-        """Advance the transition by one brain step."""
+    def step(self, n: int = 1):
+        """Advance the transition by n brain ticks."""
         if self._transition_progress < 1.0:
-            self._steps_in_transition += 1
-            self._transition_progress = min(
-                1.0, self._steps_in_transition / max(1, self.transition_steps)
-            )
+            self._steps_in_transition += n
+            tau = max(1, self.transition_tau)
+            self._transition_progress = 1.0 - math.exp(-self._steps_in_transition / tau)
+            if self._transition_progress > 0.995:
+                self._transition_progress = 1.0
 
     def current_setpoints(self) -> HomeostasisSetpoints:
         """Get the current blended setpoints."""
@@ -142,7 +190,7 @@ class StageManager:
             "current_stage": self.current_stage,
             "transition_progress": self._transition_progress,
             "steps_in_transition": self._steps_in_transition,
-            "transition_steps": self.transition_steps,
+            "transition_tau": self.transition_tau,
         }
 
     def load_state_dict(self, d: dict):
@@ -152,4 +200,5 @@ class StageManager:
             self._to_setpoints = STAGES[stage]
         self._transition_progress = d.get("transition_progress", 1.0)
         self._steps_in_transition = d.get("steps_in_transition", 0)
-        self.transition_steps = d.get("transition_steps", self.transition_steps)
+        self.transition_tau = d.get("transition_tau",
+                                    d.get("transition_steps", self.transition_tau))

@@ -42,6 +42,7 @@ class Checkpointer:
         # Save brain metadata
         meta = {
             "age": brain.age,
+            "birth_edges": brain.birth_edges,
             "neuromod": brain.neuromod.to_dict(),
             "fatigue": brain.fatigue.to_dict(),
             "rng_state": brain.rng.bit_generator.state,

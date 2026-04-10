@@ -35,6 +35,9 @@ class HomeostasisSetpoints:
     fatigue_threshold: float = 10.0        # sleep trigger level
     wta_active_frac: float = 0.2            # fraction of internal pool that fires at full rate
     noise_std: float = 0.02                  # membrane noise (spontaneous activity driver)
+    task_mix_ratio: float = 0.0              # 0.0=all stimuli, 1.0=all tasks (interpolated across stages)
+    babble_ratio: float = 0.0               # fraction of waking spent on motor babble + mimicry
+    copy_strength: float = 1.0               # multiplier on copy pathway weights (instinct decay)
 
     def interpolate(self, other: "HomeostasisSetpoints", t: float) -> "HomeostasisSetpoints":
         """Linearly interpolate between self and other at fraction t in [0, 1]."""
@@ -63,4 +66,7 @@ class HomeostasisSetpoints:
             fatigue_threshold=s * self.fatigue_threshold + t * other.fatigue_threshold,
             wta_active_frac=s * self.wta_active_frac + t * other.wta_active_frac,
             noise_std=s * self.noise_std + t * other.noise_std,
+            task_mix_ratio=s * self.task_mix_ratio + t * other.task_mix_ratio,
+            babble_ratio=s * self.babble_ratio + t * other.babble_ratio,
+            copy_strength=s * self.copy_strength + t * other.copy_strength,
         )

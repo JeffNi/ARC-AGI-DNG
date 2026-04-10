@@ -19,7 +19,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 
-from .encoding import NUM_COLORS, grid_to_signal, pad_grid
+from .encoding import NUM_COLORS, pad_grid
 
 
 @dataclass
@@ -29,6 +29,24 @@ class Episode:
     output_grid: np.ndarray
     input_flat: np.ndarray   # flattened padded input for fast comparison
     output_flat: np.ndarray  # flattened padded output
+
+
+def _motor_hint_signal(
+    output_grid: np.ndarray,
+    motor_offset: int,
+    n_total_nodes: int,
+    max_h: int,
+    max_w: int,
+) -> np.ndarray:
+    """Encode an output grid as a one-hot motor signal placed at motor_offset."""
+    padded = pad_grid(output_grid, max_h, max_w)
+    n_cells = max_h * max_w
+    sig = np.zeros(n_total_nodes, dtype=np.float64)
+    for i in range(n_cells):
+        r, c = divmod(i, max_w)
+        color = int(padded[r, c])
+        sig[motor_offset + i * NUM_COLORS + color] = 1.0
+    return sig
 
 
 class EpisodicMemory:
@@ -131,9 +149,9 @@ class EpisodicMemory:
             if sim < 0.01:
                 continue
             w = sim ** 2  # emphasize better matches
-            hint += w * grid_to_signal(
+            hint += w * _motor_hint_signal(
                 ep.output_grid, motor_offset, n_total_nodes,
-                max_h=self.max_h, max_w=self.max_w,
+                self.max_h, self.max_w,
             )
             total_weight += w
 
@@ -198,9 +216,9 @@ class EpisodicMemory:
         ep = self.episodes[chosen]
         sim = scores[chosen]
 
-        hint = grid_to_signal(
+        hint = _motor_hint_signal(
             ep.output_grid, motor_offset, n_total_nodes,
-            max_h=self.max_h, max_w=self.max_w,
+            self.max_h, self.max_w,
         )
 
         return hint * strength * sim

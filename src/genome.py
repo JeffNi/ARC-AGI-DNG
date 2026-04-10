@@ -82,7 +82,7 @@ class Genome:
     homeostasis_interval: int = 50
 
     # ── CHL / eligibility / DA parameters (Phase 1) ───────────────────
-    chl_eta: float = 0.01
+    chl_eta: float = 0.03
     elig_eta: float = 0.2
     elig_decay: float = 0.85
     eta_local: float = 0.005      # DA-independent Hebbian rate (NMDA-like, always on)
@@ -92,6 +92,9 @@ class Genome:
     da_baseline_attempt: float = 0.0
     da_baseline_rest: float = 0.05
     da_decay: float = 0.05
+
+    # ── Synaptogenesis regulation ──────────────────────────────────────
+    peak_growth_target: float = 2.5          # density ceiling: synaptogenesis -> 0 at this multiple of birth edges
 
     # ── Fatigue / sleep ────────────────────────────────────────────────
     fatigue_rate: float = 0.05

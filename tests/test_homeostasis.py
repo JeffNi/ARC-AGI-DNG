@@ -232,28 +232,29 @@ class TestStageManager:
         assert sp.target_rate == STAGES["infancy"].target_rate
 
     def test_transition_is_gradual(self):
-        mgr = StageManager(initial_stage="infancy", transition_steps=100)
+        mgr = StageManager(initial_stage="infancy", transition_tau=100)
         mgr.transition_to("childhood")
 
         assert mgr.is_transitioning
 
-        # Step halfway
-        for _ in range(50):
+        # At t=tau (100 steps), exponential approach gives ~63%
+        for _ in range(100):
             mgr.step()
 
         sp = mgr.current_setpoints()
         infancy_rate = STAGES["infancy"].target_rate
         childhood_rate = STAGES["childhood"].target_rate
-        expected_mid = (infancy_rate + childhood_rate) / 2
+        expected_at_tau = infancy_rate + 0.632 * (childhood_rate - infancy_rate)
 
-        assert abs(sp.target_rate - expected_mid) < 0.05, \
-            f"Mid-transition rate should be ~{expected_mid}: got {sp.target_rate}"
+        assert abs(sp.target_rate - expected_at_tau) < 0.02, \
+            f"At t=tau, rate should be ~{expected_at_tau:.3f}: got {sp.target_rate:.3f}"
 
     def test_transition_completes(self):
-        mgr = StageManager(initial_stage="infancy", transition_steps=100)
+        mgr = StageManager(initial_stage="infancy", transition_tau=100)
         mgr.transition_to("childhood")
 
-        for _ in range(101):
+        # At ~5.3*tau, progress > 0.995 → snaps to 1.0
+        for _ in range(600):
             mgr.step()
 
         assert not mgr.is_transitioning
@@ -265,7 +266,7 @@ class TestStageManager:
             StageManager(initial_stage="nonexistent")
 
     def test_state_dict_round_trip(self):
-        mgr = StageManager(initial_stage="childhood", transition_steps=200)
+        mgr = StageManager(initial_stage="childhood", transition_tau=200)
         mgr.transition_to("adolescence")
         for _ in range(50):
             mgr.step()

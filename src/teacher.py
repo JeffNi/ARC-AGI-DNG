@@ -22,6 +22,7 @@ import numpy as np
 
 from .brain import Brain
 from .encoding import grid_to_signal, pad_grid, NUM_COLORS
+from .episodic_memory import EpisodicMemory
 from .monitor import Monitor
 
 
@@ -61,6 +62,7 @@ class Teacher:
         retest_interval: int = 50,
         reward_correct: float = 0.3,
         reward_wrong: float = -0.05,
+        reward_wrong_cell: float = 0.3,
         observe_steps: int = 50,
         attempt_steps: int = 80,
     ):
@@ -71,6 +73,7 @@ class Teacher:
         self.retest_interval = retest_interval
         self.reward_correct = reward_correct
         self.reward_wrong = reward_wrong
+        self.reward_wrong_cell = reward_wrong_cell
         self.observe_steps = observe_steps
         self.attempt_steps = attempt_steps
 
@@ -78,7 +81,82 @@ class Teacher:
         self._tasks_by_type: dict[str, list[dict]] = {}
         self._tier_order: list[str] = []
 
+        self.episodic_memory = EpisodicMemory(
+            max_h=brain.net.max_h, max_w=brain.net.max_w,
+        )
+
         self._load_tasks()
+        self._generate_micro_tasks()
+
+    def _generate_micro_tasks(self):
+        """Generate simple pixel-manipulation tasks programmatically.
+
+        These are the earliest curriculum tier — they test whether the
+        learned motor pathways can produce specific outputs.  Micro-tasks
+        are deliberately trivial so the network can succeed early in
+        childhood and build momentum for harder tasks.
+        """
+        h, w = self.brain.net.max_h, self.brain.net.max_w
+        rng = np.random.default_rng(42)
+        tasks: list[dict] = []
+
+        for i in range(20):
+            kind = i % 3
+            if kind == 0:
+                # Single pixel: blank -> one pixel colored
+                train_pairs, test_pair = [], None
+                for _ in range(3):
+                    inp = [[0] * w for _ in range(h)]
+                    out = [[0] * w for _ in range(h)]
+                    r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
+                    color = int(rng.integers(1, NUM_COLORS))
+                    out[r][c] = color
+                    train_pairs.append({"input": inp, "output": out})
+                inp = [[0] * w for _ in range(h)]
+                out = [[0] * w for _ in range(h)]
+                r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
+                out[r][c] = int(rng.integers(1, NUM_COLORS))
+                test_pair = {"input": inp, "output": out}
+            elif kind == 1:
+                # Pixel copy: sparse input -> same output (mini-identity)
+                train_pairs, test_pair = [], None
+                for _ in range(3):
+                    grid = [[0] * w for _ in range(h)]
+                    n_px = int(rng.integers(1, 4))
+                    for _ in range(n_px):
+                        r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
+                        grid[r][c] = int(rng.integers(1, NUM_COLORS))
+                    train_pairs.append({"input": grid, "output": grid})
+                grid = [[0] * w for _ in range(h)]
+                for _ in range(int(rng.integers(1, 4))):
+                    r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
+                    grid[r][c] = int(rng.integers(1, NUM_COLORS))
+                test_pair = {"input": grid, "output": grid}
+            else:
+                # Color fill: blank -> one row filled
+                train_pairs, test_pair = [], None
+                for _ in range(3):
+                    inp = [[0] * w for _ in range(h)]
+                    out = [[0] * w for _ in range(h)]
+                    row = int(rng.integers(0, h))
+                    color = int(rng.integers(1, NUM_COLORS))
+                    out[row] = [color] * w
+                    train_pairs.append({"input": inp, "output": out})
+                inp = [[0] * w for _ in range(h)]
+                out = [[0] * w for _ in range(h)]
+                row = int(rng.integers(0, h))
+                out[row] = [int(rng.integers(1, NUM_COLORS))] * w
+                test_pair = {"input": inp, "output": out}
+
+            tasks.append({
+                "train": train_pairs,
+                "test": [test_pair],
+                "_file": f"micro_{i:03d}.json",
+                "_tier": "tier_micro",
+            })
+
+        self._tasks_by_type["tier_micro"] = tasks
+        self._tier_order.append("tier_micro")
 
     def _task_fits(self, task: dict) -> bool:
         """Check if all grids in a task fit within the brain's max dimensions."""
@@ -233,11 +311,15 @@ class Teacher:
         spotlight = sp.spotlight_strength
 
         # --- Phase 1: Demonstrations ---
-        # Show multiple input+output pairs so the brain sees the pattern
+        # Show multiple input+output pairs so the brain sees the pattern.
+        # Each demo is also stored in episodic memory (hippocampal encoding).
+        self.episodic_memory.clear()
         demo_pairs = pairs[:n_demos] if n_demos > 0 else []
         for dp in demo_pairs:
             dp_in = pad_grid(np.array(dp["input"], dtype=np.int32), h, w)
             dp_out = pad_grid(np.array(dp["output"], dtype=np.int32), h, w)
+
+            self.episodic_memory.store(dp_in, dp_out)
 
             sensory = self._build_spotlight_signal(dp_in, dp_out, h, w, spotlight)
             motor = self._motor_signal_from_grid(dp_out, h, w)
@@ -256,39 +338,87 @@ class Teacher:
         expected_grid = pad_grid(np.array(test_pair["output"], dtype=np.int32), h, w)
         out_h, out_w = expected_grid.shape
 
+        # Clear motor state from demos — the motor system relaxes before
+        # attempting a new action. V and adaptation carry residual demo
+        # colors that would bias WTA toward the wrong output.
+        motor_nodes = self.brain.net.output_nodes
+        self.brain.net.V[motor_nodes] = 0.0
+        self.brain.net.r[motor_nodes] = 0.0
+        self.brain.net.adaptation[motor_nodes] = 0.0
+
+        # Reset eligibility traces before the attempt. Demo-phase traces
+        # encode the demo's output pattern into internal->motor edges;
+        # applying reward on those traces would reinforce task-specific
+        # memorization rather than generalizable mappings. Only the
+        # attempt-phase activity should drive reward learning.
+        ne = self.brain.net._edge_count
+        self.brain.net._edge_eligibility[:ne] = 0.0
+
         signal = grid_to_signal(input_grid, max_h=h, max_w=w)
         self.brain.store_signal(signal)
         self.brain.inject_signal(signal)
 
-        free_corr = self.brain.snapshot_correlations(n_steps=self.attempt_steps)
+        # Hippocampal recall: retrieve the most similar stored output and
+        # inject as a soft motor hint. For identity tasks, this is redundant
+        # with the copy pathway. For non-identity, this IS the answer.
+        hint = self.episodic_memory.recall_signal(
+            input_grid,
+            motor_offset=self.brain._motor_start,
+            n_total_nodes=self.brain.net.n_nodes,
+            strength=0.3,
+        )
+        if hint is not None and np.any(hint != 0):
+            self.brain.add_motor_hint(hint[self.brain._motor_start:])
+
+        # Let copy pathway fire (fast instinct) then read motor output
+        # before internal pathways override it. clamp_sensory ensures
+        # L1→sensory feedback can't corrupt color perception during the
+        # critical motor readout window.
+        self.brain.step(n_steps=5, clamp_sensory=True)
         output_grid = self.brain.read_motor(out_h, out_w)
 
-        # --- Phase 3: Evaluate and reward ---
+        # --- Phase 3: Evaluate and reward (per-cell) ---
+        # Apply reward IMMEDIATELY after motor readout, while eligibility
+        # traces reflect only the 5-step copy/motor response. Waiting
+        # until after snapshot_correlations lets 35 more steps of internal
+        # activity contaminate eligibility, encoding task-specific patterns
+        # into internal->motor edges and breaking subsequent tasks.
         correct = np.array_equal(output_grid, expected_grid)
         n_cells = out_h * out_w
         cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
 
-        if correct:
-            reward = self.reward_correct
-        else:
-            reward = self.reward_wrong * (1.0 - cell_acc)
+        expected_colors = set(int(expected_grid[r, c])
+                              for r in range(out_h) for c in range(out_w))
 
-        mean_change = self.brain.apply_reward(reward)
+        max_h = self.brain.net.max_h
+        max_w = self.brain.net.max_w
+        cell_rewards = np.zeros(max_h * max_w, dtype=np.float64)
+        for r in range(out_h):
+            for c in range(out_w):
+                idx = r * max_w + c
+                got = int(output_grid[r, c])
+                want = int(expected_grid[r, c])
+                if got == want:
+                    cell_rewards[idx] = self.reward_correct
+                elif got in expected_colors:
+                    cell_rewards[idx] = -self.reward_wrong_cell * 0.3
+                else:
+                    cell_rewards[idx] = -self.reward_wrong_cell
 
-        # --- Phase 4: Correction (CHL) ---
-        if not correct:
-            teach_sensory = self._build_spotlight_signal(
-                input_grid, expected_grid, h, w, spotlight,
-            )
-            motor = self._motor_signal_from_grid(expected_grid, h, w)
-            self.brain.inject_teaching_signal(teach_sensory, motor)
-            clamped_corr = self.brain.snapshot_correlations(
-                n_steps=self.observe_steps // 2,
-            )
-            chl_change = self.brain.apply_chl(free_corr, clamped_corr)
-        else:
-            self.brain.store_replay(free_corr, free_corr)
-            chl_change = 0.0
+        reward = float(cell_rewards.mean())
+        mean_change = self.brain.apply_cell_reward(cell_rewards)
+
+        # Continue stepping for correlations (CHL bookkeeping for sleep
+        # replay). Eligibility is now stale from reward consumption.
+        remaining = max(1, self.attempt_steps - 5)
+        free_corr = self.brain.snapshot_correlations(n_steps=remaining)
+
+        # --- Phase 4: Replay storage (CHL disabled — not biologically grounded) ---
+        # CHL required a teacher to clamp output neurons, which brains don't
+        # have.  Motor learning now comes from babbling + mimicry (Hebbian
+        # co-activation) and per-cell reward (eligibility + DA).
+        chl_change = 0.0
+        self.brain.store_replay(free_corr, free_corr)
 
         # --- Phase 5: Rest + spontaneous replay ---
         self.brain.clear_signal()

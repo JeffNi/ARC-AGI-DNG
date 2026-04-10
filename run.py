@@ -392,10 +392,10 @@ def run_infancy(
     stimuli: InfancyStimuli,
     birth_edges: int,
     max_days: int = 100,
-    stimuli_per_day: int = 30,
-    observe_steps: int = 50,
-    rest_steps: int = 20,
-    growth_target: float = 3.0,
+    stimuli_per_day: int = 60,
+    observe_steps: int = 25,
+    rest_steps: int = 10,
+    growth_target: float = 2.5,
     spontaneous_threshold: float = 0.03,
 ) -> int:
     """
@@ -524,9 +524,9 @@ def main():
     parser.add_argument("--fresh", action="store_true", help="Force new brain (ignore checkpoints)")
     parser.add_argument("--eval-every", type=int, default=5, help="Run eval snapshot every N days (0=never)")
     parser.add_argument("--snapshot-every", type=int, default=1, help="Log brain health snapshot every N days")
-    parser.add_argument("--infancy-days", type=int, default=50, help="Max infancy days (0=skip)")
-    parser.add_argument("--infancy-stimuli", type=int, default=30, help="Stimuli per infancy day")
-    parser.add_argument("--growth-target", type=float, default=4.0, help="Synapse growth target (multiple of birth)")
+    parser.add_argument("--infancy-days", type=int, default=20, help="Max infancy days (0=skip)")
+    parser.add_argument("--infancy-stimuli", type=int, default=60, help="Stimuli per infancy day")
+    parser.add_argument("--growth-target", type=float, default=2.5, help="Synapse growth target (multiple of birth)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _handle_sigint)

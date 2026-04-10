@@ -146,6 +146,71 @@ def eligibility_modulated_update(
     return float(np.mean(change))
 
 
+def eligibility_modulated_update_percell(
+    net: DNG,
+    da_per_node: np.ndarray,
+    eta: float = 0.02,
+    w_max: float = 5.0,
+) -> float:
+    """
+    Per-cell reward: each edge gets DA from its destination node.
+
+    Topographic DA analog — striatal patches receive different dopamine
+    based on which cortical motor area projects to them. Correct motor
+    cells get positive DA, wrong cells get negative DA, non-motor nodes
+    get zero (their learning happens via novelty DA in the main loop).
+
+    Same mechanics as eligibility_modulated_update (consolidation
+    protection, Dale's law, clipping) but with a per-edge DA vector.
+    """
+    n = net._edge_count
+    if n == 0:
+        return 0.0
+
+    elig = net._edge_eligibility[:n]
+    if not np.any(elig > 1e-6):
+        return 0.0
+
+    dst = net._edge_dst[:n]
+    da_per_edge = da_per_node[dst]
+
+    active = np.abs(da_per_edge) > 1e-8
+    if not active.any():
+        return 0.0
+
+    dw = np.zeros(n, dtype=np.float64)
+    dw[active] = eta * da_per_edge[active] * elig[active]
+
+    cons = net._edge_consolidation[:n]
+    if cons.any():
+        plasticity_scale = 1.0 / (1.0 + cons)
+        dw *= plasticity_scale
+
+    # Copy edges get re-pinned every step — don't waste reward signal on them
+    copy_edges = cons >= 20.0
+    dw[copy_edges] = 0.0
+
+    w = net._edge_w[:n]
+
+    neg_mask = w < 0
+    dw[neg_mask] = -dw[neg_mask]
+
+    new_w = w + dw
+
+    pos_mask = w > 0
+    new_w[pos_mask] = np.clip(new_w[pos_mask], 1e-6, w_max)
+    new_w[neg_mask] = np.clip(new_w[neg_mask], -w_max, -1e-6)
+
+    change = np.abs(new_w - w)
+    net._edge_w[:n] = new_w
+    net._edge_tag[:n] += change
+    net._csr_dirty = True
+
+    net._edge_eligibility[:n] *= 0.5
+
+    return float(np.mean(change[active]))
+
+
 # ── Consolidation ─────────────────────────────────────────────────
 
 def consolidate_synapses(
@@ -326,6 +391,7 @@ def synaptogenesis(
     n_candidates: int = 5_000,
     activity_ema: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
+    allow_motor_target: bool = True,
 ) -> int:
     """
     Co-activity based synaptogenesis: fire together, wire together.
@@ -359,6 +425,7 @@ def synaptogenesis(
     region_list = list(Region)
     sensory_idx = region_list.index(Region.SENSORY)
     motor_idx = region_list.index(Region.MOTOR)
+    l1_idx = region_list.index(Region.LOCAL_DETECT)
 
     # Use EMA rates for stable activity signal, fall back to instantaneous
     activity = activity_ema if activity_ema is not None else net.r
@@ -385,11 +452,22 @@ def synaptogenesis(
     src_all = np.concatenate([src_active, src_explore])
     dst_all = np.concatenate([dst_active, dst_explore])
 
-    # Biological constraints: no self-loops, no edges TO sensory, no edges FROM motor
+    # Biological constraints:
+    #  - no self-loops
+    #  - no edges TO sensory
+    #  - no edges FROM motor
+    #  - sensory can only project to L1 (thalamocortical targeting —
+    #    axon guidance molecules restrict thalamic afferents to layer 4
+    #    of primary sensory cortex, not higher areas)
+    src_is_sensory = net.regions[src_all] == sensory_idx
+    dst_is_l1 = net.regions[dst_all] == l1_idx
+    dst_is_motor = net.regions[dst_all] == motor_idx
     valid = (
         (src_all != dst_all)
         & (net.regions[dst_all] != sensory_idx)
         & (net.regions[src_all] != motor_idx)
+        & (~src_is_sensory | dst_is_l1)
+        & (allow_motor_target | ~dst_is_motor)
     )
     src_all = src_all[valid]
     dst_all = dst_all[valid]
@@ -420,9 +498,12 @@ def synaptogenesis(
     src_all = src_all[unique_idx]
     dst_all = dst_all[unique_idx]
 
-    # Acceptance: co-activation driven + tiny exploratory baseline
+    # Acceptance: co-activation driven + neurotrophin-gated baseline.
+    # During infancy (high growth_rate), baseline is substantial — models
+    # exuberant, activity-independent growth driven by molecular cues.
+    # During adulthood (low growth_rate), baseline shrinks to near zero.
     coact = activity[src_all] * activity[dst_all]
-    baseline_p = 0.001 * net.ach
+    baseline_p = 0.005 * growth_rate * net.ach
     prob = growth_rate * net.ach * coact + baseline_p
 
     # Layer-distance decay: connections between distant cortical layers

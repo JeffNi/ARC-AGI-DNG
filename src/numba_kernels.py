@@ -238,7 +238,168 @@ def run_steps(
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
 
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _spmv_csr_parallel(indptr, indices, data, buf, syn, n_nodes):
+    """Parallel sparse matmul with active-input normalization.
+
+    Groups by destination node so each thread owns its accumulator —
+    no write conflicts, scales linearly with cores.
+    """
+    for dst in numba.prange(n_nodes):
+        acc = 0.0
+        n_act = 0.0
+        for j in range(indptr[dst], indptr[dst + 1]):
+            pre_val = buf[indices[j]]
+            if pre_val > 0.001:
+                acc += data[j] * pre_val
+                n_act += 1.0
+        syn[dst] = acc / (n_act + 1.0) ** 0.5
+
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _eligibility_update_parallel(
+    edge_elig, edge_src, edge_dst, r, edge_plastic, n_edges, elig_decay,
+):
+    """Parallel eligibility trace update — ALL edges including motor.
+
+    Motor edges need eligibility traces for DA-based reward learning
+    (basal ganglia analog). Only K-H competitive plasticity excludes
+    motor edges (via edge_plastic in _plasticity_update_parallel).
+    """
+    for e in numba.prange(n_edges):
+        edge_elig[e] *= elig_decay
+        co = r[edge_src[e]] * r[edge_dst[e]]
+        if co > 0.001:
+            edge_elig[e] += co
+
+
+@numba.jit(nopython=True, parallel=True, cache=True)
+def _plasticity_update_parallel(
+    edge_w, edge_src, edge_dst, r_pre_wta, edge_plastic, n_edges,
+    node_col_id, col_mean_r, ema_rate_dendritic,
+    eta_local, eta, DA, w_max,
+):
+    """Parallel Krotov-Hopfield competitive Hebbian — each edge is independent."""
+    _EPS = 1e-6
+    for e in numba.prange(n_edges):
+        if not edge_plastic[e]:
+            continue
+        pre_r = r_pre_wta[edge_src[e]]
+        post_pre_wta = r_pre_wta[edge_dst[e]]
+        if pre_r < 0.001 and post_pre_wta < 0.001:
+            continue
+
+        col_id = node_col_id[edge_dst[e]]
+        if col_id < 0:
+            h_star = 0.0
+        else:
+            h_star = col_mean_r[col_id]
+
+        dst_ema = ema_rate_dendritic[edge_dst[e]]
+        conscience = dst_ema - h_star
+        if conscience > 0.0:
+            h_star += conscience
+
+        delta = post_pre_wta - h_star
+        if delta > 0.0:
+            g_h = delta * delta
+        else:
+            g_h = 0.0
+
+        if g_h < 1e-8:
+            continue
+
+        w_old = edge_w[e]
+        w_abs = w_old if w_old > 0.0 else -w_old
+
+        dw = eta_local * g_h * (pre_r - w_abs)
+        dw += eta * DA * g_h * pre_r
+
+        if w_old < 0.0:
+            dw = -dw
+        w_new = w_old + dw
+        if w_old > 0.0:
+            if w_new < _EPS:
+                w_new = _EPS
+            elif w_new > w_max:
+                w_new = w_max
+        else:
+            if w_new > -_EPS:
+                w_new = -_EPS
+            elif w_new < -w_max:
+                w_new = -w_max
+        edge_w[e] = w_new
+
+
 @numba.jit(nopython=True, cache=True)
+def _col_thresholds(r_pre_wta, col_pool, col_sizes, col_offsets, n_cols, col_mean_r):
+    """Per-column plasticity threshold: midpoint of mean and max pre-WTA rate."""
+    for c in range(n_cols):
+        offset = col_offsets[c]
+        size = col_sizes[c]
+        if size == 0:
+            col_mean_r[c] = 0.0
+            continue
+        acc = 0.0
+        mx = 0.0
+        for k in range(size):
+            rv = r_pre_wta[col_pool[offset + k]]
+            acc += rv
+            if rv > mx:
+                mx = rv
+        mean_r = acc / size
+        col_mean_r[c] = mean_r + 0.5 * (mx - mean_r)
+
+
+@numba.jit(nopython=True, cache=True)
+def _node_dynamics(
+    V, r, prev_r, f, threshold, leak, excitability, adaptation,
+    syn, signal, noise_row, noise_scale, has_signal,
+    max_rate, f_rate_eff, f_decay, f_max,
+    adapt_rate, adapt_decay, refractory_mask, r_pre_wta, n_nodes,
+):
+    """Membrane, rate, facilitation, and adaptation update for all nodes."""
+    for i in range(n_nodes):
+        prev_r[i] = r[i]
+
+        vi = (1.0 - leak[i]) * V[i] + leak[i] * excitability[i] * syn[i]
+        if has_signal:
+            vi += signal[i]
+        vi += noise_row[i] * noise_scale
+        vi -= adaptation[i]
+        if vi > 5.0:
+            vi = 5.0
+        elif vi < -1.0:
+            vi = -1.0
+        V[i] = vi
+
+        ri = vi - threshold[i]
+        if ri < 0.0:
+            ri = 0.0
+        elif ri > max_rate[i]:
+            ri = max_rate[i]
+
+        if refractory_mask[i] and prev_r[i] > 0.8 * max_rate[i]:
+            ri *= 0.1
+
+        r[i] = ri
+        r_pre_wta[i] = ri
+
+        fi = f[i] * (1.0 - f_decay) + f_rate_eff * ri
+        if fi < 0.0:
+            fi = 0.0
+        elif fi > f_max:
+            fi = f_max
+        f[i] = fi
+
+        ai = adaptation[i] * (1.0 - adapt_decay) + adapt_rate[i] * ri
+        if ai < 0.0:
+            ai = 0.0
+        elif ai > 5.0:
+            ai = 5.0
+        adaptation[i] = ai
+
+
 def run_steps_plastic(
     V, r, prev_r, f, threshold, leak, excitability, adaptation,
     edge_src, edge_dst, edge_w, n_edges, inh_scale,
@@ -259,185 +420,67 @@ def run_steps_plastic(
     node_col_id,
     col_mean_r,
     ema_rate_dendritic,
+    csr_indptr=None, csr_indices=None, csr_data=None,
 ):
     """
     Dynamics with competitive Hebbian plasticity + eligibility traces.
 
-    Every step: eligibility traces accumulate from pre*post co-activity.
-    Every plasticity_interval steps: Krotov-Hopfield competitive update.
-    Winners (pre-WTA rate above conscience-adjusted threshold) get
-    contrastive LTP. The per-neuron EMA rate acts as a "conscience"
-    (DeSieno 1988): frequent winners get a higher threshold, forcing
-    the network to rotate winners across stimuli.
+    Dispatches to parallel sub-kernels when CSR arrays are provided,
+    otherwise falls back to the sequential COO path.
+
+    The CSR matmul uses inh_scale-baked weights (built once per call)
+    so plasticity-driven weight tweaks within the 25-step window are
+    negligible — weights are refreshed on the next step() call.
     """
-    _EPS = 1e-6
-    buf = np.empty(n_nodes)
     syn = np.empty(n_nodes)
-    n_active = np.empty(n_nodes)
+    buf = np.empty(n_nodes)
+
+    use_parallel = csr_indptr is not None
 
     for s in range(n_steps):
         for i in range(n_nodes):
             buf[i] = r[i] * (1.0 + f[i])
 
-        for i in range(n_nodes):
-            syn[i] = 0.0
-            n_active[i] = 0.0
-        for e in range(n_edges):
-            pre_val = buf[edge_src[e]]
-            if pre_val > 0.001:
-                w_eff = edge_w[e]
-                if w_eff < 0.0:
-                    w_eff *= inh_scale
-                syn[edge_dst[e]] += w_eff * pre_val
-                n_active[edge_dst[e]] += 1.0
-        for i in range(n_nodes):
-            denom = (n_active[i] + 1.0) ** 0.5
-            syn[i] /= denom
+        if use_parallel:
+            _spmv_csr_parallel(csr_indptr, csr_indices, csr_data, buf, syn, n_nodes)
+        else:
+            n_active = np.empty(n_nodes)
+            for i in range(n_nodes):
+                syn[i] = 0.0
+                n_active[i] = 0.0
+            for e in range(n_edges):
+                pre_val = buf[edge_src[e]]
+                if pre_val > 0.001:
+                    w_eff = edge_w[e]
+                    if w_eff < 0.0:
+                        w_eff *= inh_scale
+                    syn[edge_dst[e]] += w_eff * pre_val
+                    n_active[edge_dst[e]] += 1.0
+            for i in range(n_nodes):
+                syn[i] /= (n_active[i] + 1.0) ** 0.5
 
-        for i in range(n_nodes):
-            prev_r[i] = r[i]
+        _node_dynamics(
+            V, r, prev_r, f, threshold, leak, excitability, adaptation,
+            syn, signal, noise_matrix[s], noise_scale, has_signal,
+            max_rate, f_rate_eff, f_decay, f_max,
+            adapt_rate, adapt_decay, refractory_mask, r_pre_wta, n_nodes,
+        )
 
-            vi = (1.0 - leak[i]) * V[i] + leak[i] * excitability[i] * syn[i]
-            if has_signal:
-                vi += signal[i]
-            vi += noise_matrix[s, i] * noise_scale
-            vi -= adaptation[i]
-            if vi > 5.0:
-                vi = 5.0
-            elif vi < -1.0:
-                vi = -1.0
-            V[i] = vi
-
-            ri = vi - threshold[i]
-            if ri < 0.0:
-                ri = 0.0
-            elif ri > max_rate[i]:
-                ri = max_rate[i]
-
-            if refractory_mask[i] and prev_r[i] > 0.8 * max_rate[i]:
-                ri *= 0.1
-
-            r[i] = ri
-            r_pre_wta[i] = ri
-
-            fi = f[i] * (1.0 - f_decay) + f_rate_eff * ri
-            if fi < 0.0:
-                fi = 0.0
-            elif fi > f_max:
-                fi = f_max
-            f[i] = fi
-
-            ai = adaptation[i] * (1.0 - adapt_decay) + adapt_rate[i] * ri
-            if ai < 0.0:
-                ai = 0.0
-            elif ai > 5.0:
-                ai = 5.0
-            adaptation[i] = ai
-
-        # Compute per-column plasticity threshold from PRE-WTA rates,
-        # before WTA zeroes out losers.
-        # Threshold = midpoint between column mean and max pre-WTA rate.
-        # This ensures only the top few neurons per column get LTP,
-        # creating sharper competition than using the mean alone.
-        for c in range(n_cols):
-            offset = col_offsets[c]
-            size = col_sizes[c]
-            if size == 0:
-                col_mean_r[c] = 0.0
-                continue
-            acc = 0.0
-            mx = 0.0
-            for k in range(size):
-                rv = r_pre_wta[col_pool[offset + k]]
-                acc += rv
-                if rv > mx:
-                    mx = rv
-            mean_r = acc / size
-            col_mean_r[c] = mean_r + 0.5 * (mx - mean_r)
-
+        _col_thresholds(r_pre_wta, col_pool, col_sizes, col_offsets, n_cols, col_mean_r)
         wta_columnar(r, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r, mem_pool_indices, mem_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
-        # Eligibility uses post-WTA rates (actual spike-driven signals)
-        for e in range(n_edges):
-            edge_elig[e] *= elig_decay
-            if not edge_plastic[e]:
-                continue
-            pre_r = r[edge_src[e]]
-            post_r = r[edge_dst[e]]
-            co = pre_r * post_r
-            if co > 0.001:
-                edge_elig[e] += co
+        _eligibility_update_parallel(
+            edge_elig, edge_src, edge_dst, r, edge_plastic, n_edges, elig_decay,
+        )
 
-        # Competitive Hebbian plasticity — proper Krotov-Hopfield (2019).
-        #
-        # The K-H contrastive rule moves each winning neuron's weight
-        # vector TOWARD the current input pattern:
-        #
-        #   dW = eta * g(h) * (v_pre - |w|)
-        #
-        # This is self-normalizing: weights converge to the centroid
-        # of winning input patterns (like k-means). No separate decay
-        # term needed — the (v - w) contrastive form prevents runaway.
-        #
-        # g(h) = ReLU(delta)^2 where delta = r_pre_wta - threshold.
-        # Only winners (delta > 0) learn. Losers' weights are preserved,
-        # letting them remain candidates for other stimuli.
         if plasticity_interval > 0 and s > 0 and s % plasticity_interval == 0:
-            for e in range(n_edges):
-                if not edge_plastic[e]:
-                    continue
-                pre_r = r_pre_wta[edge_src[e]]
-                post_pre_wta = r_pre_wta[edge_dst[e]]
-                if pre_r < 0.001 and post_pre_wta < 0.001:
-                    continue
-
-                col_id = node_col_id[edge_dst[e]]
-                if col_id < 0:
-                    h_star = 0.0
-                else:
-                    h_star = col_mean_r[col_id]
-
-                # Conscience: raise threshold for neurons that fire
-                # frequently (EMA > column mean). Frequent winners must
-                # exceed a higher bar, giving underused neurons a chance.
-                dst_ema = ema_rate_dendritic[edge_dst[e]]
-                conscience = dst_ema - h_star
-                if conscience > 0.0:
-                    h_star += conscience
-
-                delta = post_pre_wta - h_star
-                if delta > 0.0:
-                    g_h = delta * delta
-                else:
-                    g_h = 0.0
-
-                if g_h < 1e-8:
-                    continue
-
-                w_old = edge_w[e]
-                w_abs = w_old if w_old > 0.0 else -w_old
-
-                # Contrastive update: pull weight toward input
-                dw = eta_local * g_h * (pre_r - w_abs)
-                # DA-gated term for reward-modulated learning
-                dw += eta * DA * g_h * pre_r
-
-                if w_old < 0.0:
-                    dw = -dw
-                w_new = w_old + dw
-                if w_old > 0.0:
-                    if w_new < _EPS:
-                        w_new = _EPS
-                    elif w_new > w_max:
-                        w_new = w_max
-                else:
-                    if w_new > -_EPS:
-                        w_new = -_EPS
-                    elif w_new < -w_max:
-                        w_new = -w_max
-                edge_w[e] = w_new
+            _plasticity_update_parallel(
+                edge_w, edge_src, edge_dst, r_pre_wta, edge_plastic, n_edges,
+                node_col_id, col_mean_r, ema_rate_dendritic,
+                eta_local, eta, DA, w_max,
+            )
 
 
 @numba.jit(nopython=True, cache=True)

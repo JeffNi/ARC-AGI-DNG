@@ -132,7 +132,7 @@ class DNG:
 
     # E/I balance (developmental)
     inh_scale: float = 1.0    # multiplier for inhibitory (negative) weights
-    _last_inh_scale: float = field(default=1.0, repr=False)
+    _last_inh_scale: float = field(default=-1.0, repr=False)
 
     # Node groups
     input_nodes: np.ndarray = None
