@@ -424,13 +424,25 @@ def run_life(
         dt = time.time() - t0
 
         # --- Diagnostics ---
-        growth_ratio = brain.net._edge_count / max(1, brain.birth_edges)
+        ne = brain.net._edge_count
+        growth_ratio = ne / max(1, brain.birth_edges)
         density_f = max(0.0, 1.0 - growth_ratio / genome.peak_growth_target)
         ema_d = brain.homeostasis.ema_rate_dendritic
         demand_f = float((ema_d < sp.target_rate).mean())
 
         stage_tag = brain.stage_manager.current_stage[:4]
         trans = brain.stage_manager._transition_progress
+
+        # Per-layer edge counts
+        from src.graph import layer_index as _li
+        _src_l = np.array([_li(int(r)) for r in brain.net.regions[brain.net._edge_src[:ne]]])
+        _dst_l = np.array([_li(int(r)) for r in brain.net.regions[brain.net._edge_dst[:ne]]])
+        _src_l[_src_l < 0] = 0
+        _dst_l[_dst_l < 0] = 0
+        _edge_layer = np.maximum(_src_l, _dst_l)
+        n_l1_edges = int((_edge_layer == 0).sum())
+        n_l2_edges = int((_edge_layer == 1).sum())
+        n_l3_edges = int((_edge_layer == 2).sum())
 
         print(f"\n  --- Day {day} [{stage_tag}] ({dt:.0f}s) ---", flush=True)
         print(f"  babble={n_babbles}  mimicry={n_mimicry}  "
@@ -439,6 +451,8 @@ def run_life(
               f"demand_f={demand_f:.3f}  trans={trans:.3f}  "
               f"wta={sp.wta_active_frac:.3f}  "
               f"babble_r={babble_ratio:.2f}  task_r={task_ratio:.2f}", flush=True)
+        print(f"  edges: total={ne:,}  L1={n_l1_edges:,}  "
+              f"L2={n_l2_edges:,}  L3={n_l3_edges:,}", flush=True)
 
         measure(brain, h, w, f"DAY {day} ({dt:.0f}s)")
 

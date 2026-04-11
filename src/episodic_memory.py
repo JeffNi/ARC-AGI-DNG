@@ -119,6 +119,25 @@ class EpisodicMemory:
         idx = np.argsort(scores)[::-1][:top_k]
         return [(self.episodes[i], scores[i]) for i in idx]
 
+    def recall_as_sensory(
+        self,
+        query_input: np.ndarray,
+        max_h: int,
+        max_w: int,
+    ) -> np.ndarray | None:
+        """Recall best-matching output and encode as a sensory signal.
+
+        Hippocampal recall reactivates sensory cortex, not motor cortex.
+        The network must translate this internal representation into
+        action through its learned L2/L3 -> motor pathways.
+        """
+        matches = self.recall(query_input, top_k=1)
+        if not matches or matches[0][1] < 0.1:
+            return None
+        episode, _sim = matches[0]
+        from .encoding import grid_to_signal
+        return grid_to_signal(episode.output_grid, max_h=max_h, max_w=max_w)
+
     def recall_signal(
         self,
         query_input: np.ndarray,

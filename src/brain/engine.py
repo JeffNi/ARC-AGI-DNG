@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from ..graph import DNG, Region
+from ..graph import DNG, Region, layer_index
 from ..genome import Genome
 from ..encoding import grid_to_signal, signal_to_grid, NUM_COLORS
 from ..numba_kernels import run_steps_plastic, wta_motor_cells, accumulate_corr
@@ -82,7 +82,7 @@ class Brain:
 
         self.age = 0  # total steps lived
         self.birth_edges = net._edge_count  # snapshot at birth for density regulation
-        self._replay_buffer: list = []  # (free_corr, clamped_corr) for CHL replay
+        self._replay_buffer: list = []  # (free_corr, clamped_corr, da_tag) for CHL replay
         self._signal_buffer: list = []  # recent sensory signals for spontaneous replay
         self._max_replay = 50
 
@@ -151,6 +151,9 @@ class Brain:
         self._refractory_mask = np.zeros(net.n_nodes, dtype=np.bool_)
         self._refractory_mask[self._internal_idx] = True
         self._refractory_mask[self._memory_idx] = True
+
+        # Cached per-edge cortical layer classification (invalidated on edge count change)
+        self._edge_layer_cache: np.ndarray | None = None
 
     def inject_signal(self, signal: np.ndarray):
         """
@@ -344,7 +347,11 @@ class Brain:
         """Cached boolean mask: True for edges eligible for Hebbian plasticity.
 
         Motor-targeted edges learn via eligibility traces only, so they
-        are excluded here.  Invalidated when edges are added/removed.
+        are excluded here.  After infancy, L1 edges are also locked —
+        V1 critical period closes early (Hensch 2005) and L1 should be
+        a stable feature extractor, not rewritten by task-driven DA.
+
+        Invalidated when edges are added/removed or stage transitions.
         """
         cached = getattr(self, '_edge_plastic_cache', None)
         if cached is not None and len(cached) == ne:
@@ -352,8 +359,31 @@ class Brain:
         mask = np.ones(ne, dtype=np.bool_)
         motor_idx = list(Region).index(Region.MOTOR)
         mask[self.net.regions[self.net._edge_dst[:ne]] == motor_idx] = False
+
+        stage = self.stage_manager.current_stage
+        if stage not in ("infancy",):
+            edge_layers = self._get_edge_layer_class()
+            mask[edge_layers == 0] = False
+
         self._edge_plastic_cache = mask
         return mask
+
+    def _get_edge_layer_class(self) -> np.ndarray:
+        """Classify each edge by the highest cortical layer it touches.
+
+        0 = L1 (or non-cortical), 1 = L2, 2 = L3. Used to build per-edge
+        decay scale arrays for layer-aware pruning: higher layers get
+        reduced decay during early development.
+        """
+        n = self.net._edge_count
+        if self._edge_layer_cache is not None and len(self._edge_layer_cache) == n:
+            return self._edge_layer_cache
+        src_layers = np.array([layer_index(int(r)) for r in self.net.regions[self.net._edge_src[:n]]])
+        dst_layers = np.array([layer_index(int(r)) for r in self.net.regions[self.net._edge_dst[:n]]])
+        src_layers[src_layers < 0] = 0
+        dst_layers[dst_layers < 0] = 0
+        self._edge_layer_cache = np.maximum(src_layers, dst_layers)
+        return self._edge_layer_cache
 
     def step(self, n_steps: int = 10, learn: bool = True,
              clamp_sensory: bool = False):
@@ -397,6 +427,10 @@ class Brain:
         self.stage_manager.step(n_steps)
         sp = self.stage_manager.current_setpoints()
         self.homeostasis.setpoints = sp
+
+        # L1 critical period depends on stage — invalidate during transitions
+        if self.stage_manager.is_transitioning:
+            self._edge_plastic_cache = None
 
         # Sync developmental parameters from genetic clock
         self.neuromod.da_baseline = sp.da_baseline
@@ -515,11 +549,22 @@ class Brain:
             eff_rate = sp.synaptogenesis_rate * density_factor * demand_factor
             eff_cand = max(1, int(sp.synaptogenesis_candidates * density_factor))
 
+            # Birth-edge floor: boost growth when below birth count
+            edge_ratio = self.net._edge_count / max(1, self.birth_edges)
+            if edge_ratio < 1.0:
+                floor_boost = 1.0 + 2.0 * (1.0 - edge_ratio)
+                eff_rate *= floor_boost
+                eff_cand = int(eff_cand * floor_boost)
+
             if eff_rate > 0.001:
                 # Motor cortex matures later than sensory cortex — block
                 # new synapses targeting motor neurons until childhood.
                 stage = self.stage_manager.current_stage
                 motor_ok = stage not in ("infancy", "late_infancy")
+                layer_boost = {
+                    1: sp.synaptogenesis_L2_boost,
+                    2: sp.synaptogenesis_L3_boost,
+                }
                 old_ne = self.net._edge_count
                 synaptogenesis(
                     self.net,
@@ -528,11 +573,13 @@ class Brain:
                     activity_ema=ema_d,
                     rng=self.rng,
                     allow_motor_target=motor_ok,
+                    layer_demand_boost=layer_boost,
                 )
                 if self.net._edge_count != old_ne:
                     self._edge_plastic_cache = None
                     self._memory_gate_cache = None
                     self._sensory_motor_cache = None
+                    self._edge_layer_cache = None
 
         # Copy pathway maintenance: re-pin instinct weights every step.
         # Without this, SHY sleep downscaling erodes them nightly.
@@ -830,16 +877,37 @@ class Brain:
 
         sp = self.stage_manager.current_setpoints()
 
+        # Layer-aware health decay: build per-edge scale from stage setpoints
+        edge_layers = self._get_edge_layer_class()
+        layer_decay_scales = np.ones(self.net._edge_count, dtype=np.float64)
+        layer_decay_scales[edge_layers == 1] = sp.health_decay_L2_scale
+        layer_decay_scales[edge_layers == 2] = sp.health_decay_L3_scale
+
+        # Birth-edge floor: soften pruning when below birth count
+        health_decay = sp.health_decay_rate
+        edge_ratio = self.net._edge_count / max(1, self.birth_edges)
+        if edge_ratio < 1.0:
+            deficit = 1.0 - edge_ratio
+            health_decay *= (1.0 - 0.5 * deficit)
+
         stats = nrem_sleep(
             self.net,
             self._replay_buffer,
-            chl_eta=self.genome.chl_eta * 0.5 * sp.plasticity_rate,
+            chl_eta=self.genome.chl_eta * 0.3 * sp.plasticity_rate,
             shy_downscale=0.97,
-            health_decay_rate=sp.health_decay_rate,
+            health_decay_rate=health_decay,
             ema_rate=self.homeostasis.ema_rate_dendritic,
             target_rate=sp.target_rate,
             w_max=self.genome.w_max,
+            layer_decay_scales=layer_decay_scales,
         )
+
+        # Pruning may have changed edge count — invalidate caches
+        if stats.get("pruned", 0) > 0:
+            self._edge_plastic_cache = None
+            self._memory_gate_cache = None
+            self._sensory_motor_cache = None
+            self._edge_layer_cache = None
 
         # Homeostatic corrections run during sleep, not waking.
         self.homeostasis.sleep_correction()
@@ -849,8 +917,14 @@ class Brain:
         return stats
 
     def store_replay(self, free_corr: np.ndarray, clamped_corr: np.ndarray):
-        """Store correlation pair for sleep replay."""
-        self._replay_buffer.append((free_corr.copy(), clamped_corr.copy()))
+        """Store correlation pair for sleep replay, tagged with current DA level.
+
+        Higher DA at storage time = more surprising experience = higher
+        replay priority during sleep (mirroring hippocampal sharp-wave
+        ripple prioritization of salient memories).
+        """
+        da_tag = float(self.neuromod.da)
+        self._replay_buffer.append((free_corr.copy(), clamped_corr.copy(), da_tag))
         if len(self._replay_buffer) > self._max_replay:
             self._replay_buffer.pop(0)
 

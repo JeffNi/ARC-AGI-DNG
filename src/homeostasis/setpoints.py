@@ -39,6 +39,12 @@ class HomeostasisSetpoints:
     babble_ratio: float = 0.0               # fraction of waking spent on motor babble + mimicry
     copy_strength: float = 1.0               # multiplier on copy pathway weights (instinct decay)
 
+    # --- Layer-aware pruning/growth (higher cortical layers mature later) ---
+    health_decay_L2_scale: float = 1.0        # multiplier on health_decay_rate for L2-touching edges
+    health_decay_L3_scale: float = 1.0        # multiplier on health_decay_rate for L3-touching edges
+    synaptogenesis_L2_boost: float = 1.0      # demand multiplier favoring L2-targeting growth
+    synaptogenesis_L3_boost: float = 1.0      # demand multiplier favoring L3-targeting growth
+
     def interpolate(self, other: "HomeostasisSetpoints", t: float) -> "HomeostasisSetpoints":
         """Linearly interpolate between self and other at fraction t in [0, 1]."""
         t = max(0.0, min(1.0, t))
@@ -69,4 +75,9 @@ class HomeostasisSetpoints:
             task_mix_ratio=s * self.task_mix_ratio + t * other.task_mix_ratio,
             babble_ratio=s * self.babble_ratio + t * other.babble_ratio,
             copy_strength=s * self.copy_strength + t * other.copy_strength,
+            # Layer-aware
+            health_decay_L2_scale=s * self.health_decay_L2_scale + t * other.health_decay_L2_scale,
+            health_decay_L3_scale=s * self.health_decay_L3_scale + t * other.health_decay_L3_scale,
+            synaptogenesis_L2_boost=s * self.synaptogenesis_L2_boost + t * other.synaptogenesis_L2_boost,
+            synaptogenesis_L3_boost=s * self.synaptogenesis_L3_boost + t * other.synaptogenesis_L3_boost,
         )

@@ -35,19 +35,34 @@ def nrem_sleep(
     ema_rate: np.ndarray | None = None,
     target_rate: float = 0.15,
     w_max: float = 5.0,
+    layer_decay_scales: np.ndarray | None = None,
     **kwargs,
 ) -> dict:
     """
     Full NREM sleep cycle.
 
-    replay_buffer: list of (free_corr, clamped_corr) tuples from recent tasks.
+    replay_buffer: list of (free_corr, clamped_corr, da_tag) tuples.
+        da_tag records the DA level at storage time — higher = more surprising.
+        Replays are sorted by da_tag (highest first) so the most salient
+        experiences get consolidated first, mirroring hippocampal sharp-wave
+        ripple prioritization.
+    layer_decay_scales: per-edge multiplier on health decay (layer-aware pruning).
     """
     stats = {"replays": 0, "pruned": 0}
 
-    # CHL replay: consolidate recent learning
-    n_to_replay = min(n_replay, len(replay_buffer))
+    # Sort replay buffer by DA tag (most surprising first).
+    # Handles both old 2-tuple and new 3-tuple format.
+    tagged = []
+    for entry in replay_buffer:
+        if len(entry) == 3:
+            tagged.append(entry)
+        else:
+            tagged.append((entry[0], entry[1], 0.0))
+    tagged.sort(key=lambda x: x[2], reverse=True)
+
+    n_to_replay = min(n_replay, len(tagged))
     for i in range(n_to_replay):
-        free_corr, clamped_corr = replay_buffer[-(i + 1)]
+        free_corr, clamped_corr, _da = tagged[i]
         contrastive_hebbian_update(net, free_corr, clamped_corr, eta=chl_eta,
                                    w_max=w_max)
         stats["replays"] += 1
@@ -62,6 +77,7 @@ def nrem_sleep(
     update_edge_health(
         net, decay_rate=health_decay_rate,
         ema_rate=ema_rate, target_rate=target_rate,
+        layer_decay_scales=layer_decay_scales,
     )
     stats["pruned"] = prune_sustained(net)
 

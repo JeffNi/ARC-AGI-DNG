@@ -44,6 +44,11 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         noise_std=0.05,                 # spontaneous activity: enough to fire, not enough to drown signal
         task_mix_ratio=0.0,             # pure unsupervised stimuli
         copy_strength=1.0,              # full instinct — copy pathway at birth weight
+        # Layer-aware: protect higher layers — they barely exist yet
+        health_decay_L2_scale=0.3,      # L2 almost immune to pruning
+        health_decay_L3_scale=0.1,      # L3 fully protected (PFC barely wired)
+        synaptogenesis_L2_boost=1.0,
+        synaptogenesis_L3_boost=1.0,
     ),
     "late_infancy": HomeostasisSetpoints(
         # Motor babbling and mimicry phase.  L1 is stable; the baby can
@@ -71,6 +76,11 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         task_mix_ratio=0.0,             # no formal tasks yet
         babble_ratio=0.4,               # 40% motor activities — L1 still needs its normal sensory diet
         copy_strength=1.0,              # full strength — it IS the desire to imitate
+        # Layer-aware: L2/L3 starting to wire up via babbling co-activity
+        health_decay_L2_scale=0.5,
+        health_decay_L3_scale=0.2,
+        synaptogenesis_L2_boost=1.5,    # motor babbling creates L2 demand
+        synaptogenesis_L3_boost=2.0,    # L3 needs a head start
     ),
     "childhood": HomeostasisSetpoints(
         # Identity should already work from mimicry training.
@@ -82,7 +92,7 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         ema_tau=0.02,
         # Developmental
         synaptogenesis_rate=0.15,        # slowing growth (exponential decline from infancy peak)
-        synaptogenesis_candidates=10_000,  # enough for L2/L3 cross-layer wiring
+        synaptogenesis_candidates=20_000,  # L2/L3 peak growth phase (Huttenlocher 1997)
         health_decay_rate=0.05,          # activity-dependent sculpting
         da_baseline=0.05,                # increasing DA tone
         da_sensitivity=0.5,              # stronger novelty response
@@ -95,7 +105,12 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         noise_std=0.05,                 # moderate spontaneous activity
         task_mix_ratio=0.7,             # mostly supervised tasks, 30% stimuli continues
         babble_ratio=0.1,               # some continued mimicry alongside tasks
-        copy_strength=0.5,              # decaying — sensory→motor pathway learned identity during mimicry
+        copy_strength=0.1,              # near-gone — learned pathways must carry motor output now
+        # Layer-aware: L2/L3 actively growing, still partially protected
+        health_decay_L2_scale=0.7,
+        health_decay_L3_scale=0.4,
+        synaptogenesis_L2_boost=2.0,    # cross-layer wiring demand
+        synaptogenesis_L3_boost=5.0,    # PFC peak growth — needs most help
     ),
     "adolescence": HomeostasisSetpoints(
         # Homeostatic (sleep-only application)
@@ -118,7 +133,12 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         wta_active_frac=0.1,            # tight adult E/I balance
         noise_std=0.02,                 # low spontaneous activity (adult cortex)
         task_mix_ratio=1.0,             # fully supervised
-        copy_strength=0.8,              # slight decay — cortical pathways beginning to modulate instinct
+        copy_strength=0.0,              # extinct — reflex fully replaced by cortical motor pathways
+        # Layer-aware: approaching adult — L3/PFC still last to fully mature
+        health_decay_L2_scale=1.0,
+        health_decay_L3_scale=0.8,      # PFC matures last (Petanjek 2011)
+        synaptogenesis_L2_boost=1.0,
+        synaptogenesis_L3_boost=1.0,
     ),
 }
 

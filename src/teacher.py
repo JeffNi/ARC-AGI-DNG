@@ -24,6 +24,7 @@ from .brain import Brain
 from .encoding import grid_to_signal, pad_grid, NUM_COLORS
 from .episodic_memory import EpisodicMemory
 from .monitor import Monitor
+from .rule_verifiers import verify_rule
 
 
 @dataclass
@@ -60,20 +61,15 @@ class Teacher:
         task_dir: str = "micro_tasks",
         mastery_threshold: int = 3,
         retest_interval: int = 50,
-        reward_correct: float = 0.3,
-        reward_wrong: float = -0.05,
-        reward_wrong_cell: float = 0.3,
         observe_steps: int = 50,
         attempt_steps: int = 80,
+        **kwargs,
     ):
         self.brain = brain
         self.monitor = monitor
         self.task_dir = Path(task_dir)
         self.mastery_threshold = mastery_threshold
         self.retest_interval = retest_interval
-        self.reward_correct = reward_correct
-        self.reward_wrong = reward_wrong
-        self.reward_wrong_cell = reward_wrong_cell
         self.observe_steps = observe_steps
         self.attempt_steps = attempt_steps
 
@@ -281,22 +277,22 @@ class Teacher:
 
     def run_task(self, task_type: str, task: dict) -> bool:
         """
-        Present a single task to the brain.
+        Present a single task to the brain with iterative refinement.
 
         Flow:
-          1. Demonstrations: show input+output pairs (brain sees the answer
-             being produced). Number of demos controlled by developmental stage.
-             Attention spotlight boosts cells that change.
-          2. Attempt: show new input only, brain produces its own output.
-             Capture free-phase correlations.
-          3. Reward: RPE delivered via apply_reward (the ONLY place Teacher
-             influences DA besides the implicit novelty from inject_signal).
-          4. Correction: if wrong, show correct answer, capture clamped
-             correlations, apply CHL error correction.
-          5. Rest: clear stimulus, spontaneous replay.
-
-        DA is NOT set by the Teacher — it's computed automatically by the
-        brain's novelty detector (in inject_signal) and by RPE at reward.
+          1. Sequential demos: for each pair, show input alone (L1/L2
+             encode it), then input+output together (L2/L3 encode the
+             transformation). Stored in episodic memory.
+          2. Episodic recall: flash the recalled output as a sensory
+             signal (hippocampal reactivation of sensory cortex). The
+             network must translate this into motor output on its own.
+          3. Attempt loop (max 3 tries):
+             a. Inject test input, run 10 steps, read motor output.
+             b. Binary reward: pass -> +DA, break. Fail -> -DA.
+             c. Correction: show correct answer, capture clamped
+                correlations for CHL error correction.
+             d. Rest before retry.
+          4. Consolidation: rest, spontaneous replay, sleep check.
         """
         h = self.brain.net.max_h
         w = self.brain.net.max_w
@@ -305,14 +301,11 @@ class Teacher:
         if not pairs:
             return False
 
-        # Developmental stage controls demo count and spotlight strength
         sp = self.brain.stage_manager.current_setpoints()
         n_demos = sp.n_demos
         spotlight = sp.spotlight_strength
 
-        # --- Phase 1: Demonstrations ---
-        # Show multiple input+output pairs so the brain sees the pattern.
-        # Each demo is also stored in episodic memory (hippocampal encoding).
+        # --- Phase 1: Sequential demonstrations ---
         self.episodic_memory.clear()
         demo_pairs = pairs[:n_demos] if n_demos > 0 else []
         for dp in demo_pairs:
@@ -324,113 +317,110 @@ class Teacher:
             sensory = self._build_spotlight_signal(dp_in, dp_out, h, w, spotlight)
             motor = self._motor_signal_from_grid(dp_out, h, w)
 
+            # Phase A: input alone — L1/L2 encode the input pattern
             self.brain.store_signal(sensory)
+            self.brain.inject_signal(sensory)
+            self.brain.step(n_steps=10)
+
+            # Phase B: input + output — L2/L3 encode the transformation
             self.brain.inject_teaching_signal(sensory, motor)
-            self.brain.step(n_steps=self.observe_steps)
+            self.brain.step(n_steps=15)
+
             self.brain.clear_signal()
             self.brain.step(n_steps=5)
 
-        # --- Phase 2: Attempt ---
-        # Pick a pair NOT used in demos for the test
+        # --- Phase 2: Episodic recall (sensory, not motor) ---
         remaining = [p for p in pairs if p not in demo_pairs]
         test_pair = random.choice(remaining) if remaining else random.choice(pairs)
         input_grid = pad_grid(np.array(test_pair["input"], dtype=np.int32), h, w)
         expected_grid = pad_grid(np.array(test_pair["output"], dtype=np.int32), h, w)
         out_h, out_w = expected_grid.shape
 
-        # Clear motor state from demos — the motor system relaxes before
-        # attempting a new action. V and adaptation carry residual demo
-        # colors that would bias WTA toward the wrong output.
+        recalled = self.episodic_memory.recall_as_sensory(input_grid, h, w)
+        if recalled is not None:
+            self.brain.inject_signal(recalled)
+            self.brain.step(n_steps=5, learn=False)
+            self.brain.clear_signal()
+            self.brain.step(n_steps=5)
+
+        # --- Phase 3: Attempt loop (max 3 tries) ---
         motor_nodes = self.brain.net.output_nodes
-        self.brain.net.V[motor_nodes] = 0.0
-        self.brain.net.r[motor_nodes] = 0.0
-        self.brain.net.adaptation[motor_nodes] = 0.0
+        test_signal = grid_to_signal(input_grid, max_h=h, max_w=w)
+        self.brain.store_signal(test_signal)
 
-        # Reset eligibility traces before the attempt. Demo-phase traces
-        # encode the demo's output pattern into internal->motor edges;
-        # applying reward on those traces would reinforce task-specific
-        # memorization rather than generalizable mappings. Only the
-        # attempt-phase activity should drive reward learning.
-        ne = self.brain.net._edge_count
-        self.brain.net._edge_eligibility[:ne] = 0.0
+        correct = False
+        n_attempts = 0
+        cell_acc = 0.0
+        mean_change = 0.0
+        last_free_corr = None
+        max_attempts = 3
 
-        signal = grid_to_signal(input_grid, max_h=h, max_w=w)
-        self.brain.store_signal(signal)
-        self.brain.inject_signal(signal)
+        for attempt in range(max_attempts):
+            n_attempts = attempt + 1
 
-        # Hippocampal recall: retrieve the most similar stored output and
-        # inject as a soft motor hint. For identity tasks, this is redundant
-        # with the copy pathway. For non-identity, this IS the answer.
-        hint = self.episodic_memory.recall_signal(
-            input_grid,
-            motor_offset=self.brain._motor_start,
-            n_total_nodes=self.brain.net.n_nodes,
-            strength=0.3,
-        )
-        if hint is not None and np.any(hint != 0):
-            self.brain.add_motor_hint(hint[self.brain._motor_start:])
+            # Clear motor state before each attempt
+            self.brain.net.V[motor_nodes] = 0.0
+            self.brain.net.r[motor_nodes] = 0.0
+            self.brain.net.adaptation[motor_nodes] = 0.0
 
-        # Let copy pathway fire (fast instinct) then read motor output
-        # before internal pathways override it. clamp_sensory ensures
-        # L1→sensory feedback can't corrupt color perception during the
-        # critical motor readout window.
-        self.brain.step(n_steps=5, clamp_sensory=True)
-        output_grid = self.brain.read_motor(out_h, out_w)
+            # Reset eligibility — only this attempt's activity drives reward
+            ne = self.brain.net._edge_count
+            self.brain.net._edge_eligibility[:ne] = 0.0
 
-        # --- Phase 3: Evaluate and reward (per-cell) ---
-        # Apply reward IMMEDIATELY after motor readout, while eligibility
-        # traces reflect only the 5-step copy/motor response. Waiting
-        # until after snapshot_correlations lets 35 more steps of internal
-        # activity contaminate eligibility, encoding task-specific patterns
-        # into internal->motor edges and breaking subsequent tasks.
-        correct = np.array_equal(output_grid, expected_grid)
-        n_cells = out_h * out_w
-        cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
+            self.brain.inject_signal(test_signal)
+            self.brain.step(n_steps=10, clamp_sensory=True)
+            output_grid = self.brain.read_motor(out_h, out_w)
 
-        expected_colors = set(int(expected_grid[r, c])
-                              for r in range(out_h) for c in range(out_w))
+            rule_type = task.get("type", "")
+            correct = verify_rule(rule_type, input_grid, output_grid,
+                                  expected_grid, task)
+            n_cells = out_h * out_w
+            cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
 
-        max_h = self.brain.net.max_h
-        max_w = self.brain.net.max_w
-        cell_rewards = np.zeros(max_h * max_w, dtype=np.float64)
-        for r in range(out_h):
-            for c in range(out_w):
-                idx = r * max_w + c
-                got = int(output_grid[r, c])
-                want = int(expected_grid[r, c])
-                if got == want:
-                    cell_rewards[idx] = self.reward_correct
-                elif got in expected_colors:
-                    cell_rewards[idx] = -self.reward_wrong_cell * 0.3
-                else:
-                    cell_rewards[idx] = -self.reward_wrong_cell
+            # Graded per-cell reward: correct cells reinforced, wrong cells
+            # weakened. Asymmetric magnitude (reward > punishment) prevents
+            # catastrophic unlearning. Rule-verified bonus on top.
+            cell_correct = (output_grid == expected_grid).flatten()
+            cell_rewards = np.where(cell_correct, 0.3, -0.1).astype(np.float64)
+            if correct:
+                cell_rewards += 0.2
+            mean_change = self.brain.apply_cell_reward(cell_rewards)
+            self.brain.set_da(0.4 if correct else 0.15)
 
-        reward = float(cell_rewards.mean())
-        mean_change = self.brain.apply_cell_reward(cell_rewards)
+            if correct:
+                break
 
-        # Continue stepping for correlations (CHL bookkeeping for sleep
-        # replay). Eligibility is now stale from reward consumption.
-        remaining = max(1, self.attempt_steps - 5)
-        free_corr = self.brain.snapshot_correlations(n_steps=remaining)
+            # Capture free-phase correlations (what the network did wrong)
+            last_free_corr = self.brain.snapshot_correlations(n_steps=15)
 
-        # --- Phase 4: Replay storage (CHL disabled — not biologically grounded) ---
-        # CHL required a teacher to clamp output neurons, which brains don't
-        # have.  Motor learning now comes from babbling + mimicry (Hebbian
-        # co-activation) and per-cell reward (eligibility + DA).
-        chl_change = 0.0
-        self.brain.store_replay(free_corr, free_corr)
+            # Correction: show the correct answer (input + output clamped).
+            # CHL compares these clamped correlations against the free phase
+            # to compute error-driven weight updates during sleep replay.
+            correction_sensory = grid_to_signal(input_grid, max_h=h, max_w=w)
+            correction_motor = self._motor_signal_from_grid(expected_grid, h, w)
+            self.brain.inject_teaching_signal(correction_sensory, correction_motor)
+            clamped_corr = self.brain.snapshot_correlations(n_steps=15)
 
-        # --- Phase 5: Rest + spontaneous replay ---
+            mean_change = self.brain.apply_chl(last_free_corr, clamped_corr)
+
+            self.brain.clear_signal()
+            self.brain.step(n_steps=5)
+
+        # If solved on first try, still store correlations for sleep replay
+        if correct and last_free_corr is None:
+            free_corr = self.brain.snapshot_correlations(n_steps=15)
+            self.brain.store_replay(free_corr, free_corr)
+
+        # --- Phase 4: Rest + spontaneous replay ---
         self.brain.clear_signal()
         self.brain.step(n_steps=10)
         self.brain.spontaneous_replay(n_steps=10, strength=0.2)
 
-        # Check for sleep
         sleep_stats = self.brain.try_sleep()
         if sleep_stats:
             self.monitor.sleep_event(sleep_stats, self.brain.age)
 
-        # Update tracking
+        # Update tracking (based on final attempt result)
         tracker = self.state.type_trackers.setdefault(task_type, TypeTracker())
         tracker.attempts += 1
         tracker.last_tested_age = self.brain.age
@@ -451,14 +441,21 @@ class Teacher:
         if correct:
             self.state.solves_today += 1
 
+        pixel_correct = np.array_equal(output_grid, expected_grid)
         self.monitor.task_result(
             task_type=task_type,
             task_id=task.get("_file", "unknown"),
             correct=correct,
-            reward=reward,
+            reward=cell_acc,
             mean_change=mean_change,
             age=self.brain.age,
-            extra={"cell_accuracy": cell_acc, "n_demos": len(demo_pairs)},
+            extra={
+                "cell_accuracy": cell_acc,
+                "pixel_match": pixel_correct,
+                "rule_type": rule_type,
+                "n_demos": len(demo_pairs),
+                "n_attempts": n_attempts,
+            },
         )
 
         return correct

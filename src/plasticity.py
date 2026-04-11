@@ -45,23 +45,25 @@ def contrastive_hebbian_update(
     """
     Update weights using correlation difference between clamped and free phases.
 
-    dw = eta * DA * (clamped_corr - free_corr)
+    dw = eta * (clamped_corr - free_corr)
 
-    DA can be negative, which REVERSES the update direction.
+    The correlation difference itself is the error signal — no DA gating.
+    DA's role with CHL is to tag experiences for replay priority, not to
+    gate the update. This mirrors cortical error-driven learning where the
+    mismatch between predicted and actual activity drives synaptic change
+    directly, while DA modulates consolidation priority.
     """
     n = net._edge_count
     if n == 0:
         return 0.0
 
-    da = net.da
-    modulation = eta * da
-    if abs(modulation) < 1e-8:
+    if abs(eta) < 1e-8:
         return 0.0
 
     fc = free_corr[:n] if len(free_corr) >= n else np.pad(free_corr, (0, n - len(free_corr)))
     cc = clamped_corr[:n] if len(clamped_corr) >= n else np.pad(clamped_corr, (0, n - len(clamped_corr)))
     diff = cc - fc
-    dw = modulation * diff
+    dw = eta * diff
 
     # Consolidation: well-established synapses resist modification
     cons = net._edge_consolidation[:n]
@@ -321,6 +323,7 @@ def update_edge_health(
     decay_rate: float = 0.01,
     ema_rate: np.ndarray | None = None,
     target_rate: float = 0.15,
+    layer_decay_scales: np.ndarray | None = None,
 ) -> None:
     """
     Update per-synapse health each sleep cycle. Biological model:
@@ -331,6 +334,10 @@ def update_edge_health(
     rather than per-edge eligibility traces, which decay too fast
     (0.85/step) to survive until sleep. A synapse is "active" if
     both its pre and post neurons have been firing.
+
+    layer_decay_scales: optional per-edge multiplier on decay_rate.
+    Higher cortical layers get lower multipliers during early
+    development (L3/PFC matures last — Huttenlocher 1997).
 
     Falls back to eligibility + tag if ema_rate is not provided
     (backward compat for non-Brain callers).
@@ -353,7 +360,10 @@ def update_edge_health(
         tag = net._edge_tag[:n]
         activity_factor = np.minimum(1.0, elig + tag)
 
-    health -= decay_rate * (1.0 - activity_factor)
+    if layer_decay_scales is not None:
+        health -= (decay_rate * layer_decay_scales) * (1.0 - activity_factor)
+    else:
+        health -= decay_rate * (1.0 - activity_factor)
 
     boost_mask = activity_factor > 0.3
     health[boost_mask] += 0.05 * activity_factor[boost_mask]
@@ -392,6 +402,7 @@ def synaptogenesis(
     activity_ema: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
     allow_motor_target: bool = True,
+    layer_demand_boost: dict[int, float] | None = None,
 ) -> int:
     """
     Co-activity based synaptogenesis: fire together, wire together.
@@ -519,6 +530,14 @@ def synaptogenesis(
         distance_scale[both_cortical & (layer_dist == dist)] = scale
     distance_scale[both_cortical & (layer_dist > 2)] = 0.01
     prob *= distance_scale
+
+    # Layer-aware demand boost: higher cortical layers get preferential
+    # growth during development (trophic factors from active L1 drive
+    # L2/L3 dendrite elaboration — Bhatt et al 2009).
+    if layer_demand_boost:
+        for layer_idx, boost in layer_demand_boost.items():
+            if boost != 1.0:
+                prob[dst_layers == layer_idx] *= boost
 
     np.clip(prob, 0.0, 1.0, out=prob)
     winners = rng.random(len(prob)) < prob
