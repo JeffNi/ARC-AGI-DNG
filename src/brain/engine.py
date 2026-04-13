@@ -98,6 +98,9 @@ class Brain:
         _reg = list(Region)
         self._internal_idx = np.where(_internal_mask(net.regions))[0].astype(np.int64)
         self._memory_idx = np.where(net.regions == _reg.index(Region.MEMORY))[0].astype(np.int64)
+        self._gate_idx = np.where(net.regions == _reg.index(Region.GATE))[0].astype(np.int64)
+        self._gaze_idx = np.where(net.regions == _reg.index(Region.GAZE))[0].astype(np.int64)
+        self._gaze_bias = np.zeros(len(self._gaze_idx), dtype=np.float64)
         self._motor_start = int(net.output_nodes[0]) if len(net.output_nodes) > 0 else net.n_nodes
         self._n_motor_cells = len(net.output_nodes) // NUM_COLORS if len(net.output_nodes) > 0 else 0
 
@@ -114,17 +117,15 @@ class Brain:
         # (L1: 0..n_cells-1, L2: n_cells..2*n_cells-1) so they compete
         # within-layer, not across layers.
         #
-        # L3 is non-topographic — assign all L3 neurons to a single virtual
-        # column so the K-H kernel computes a proper plasticity threshold
-        # (h_star) for them instead of defaulting to 0.
+        # L3 (mushroom body / Kenyon cells) has NO column assignment.
+        # Competition is handled by APL-style global inhibition instead
+        # of columnar WTA. L3 neurons keep column_id = -1, so the K-H
+        # kernel uses h_star = 0 for them (plasticity is mostly frozen
+        # on L2->L3 edges anyway; learning happens at L3->MOTOR).
         max_col = int(net.column_ids.max()) + 1 if len(net.column_ids) > 0 else 0
-        l3_virtual_col = max(max_col, net.max_h * net.max_w)
-        n_cols = l3_virtual_col + 1
+        n_cols = max(max_col, 1)
 
-        # Override L3 column IDs from -1 to the virtual column
         self._node_col_id = net.column_ids.astype(np.int64).copy()
-        for idx in self._l3_idx:
-            self._node_col_id[idx] = l3_virtual_col
 
         col_buckets = [[] for _ in range(n_cols)]
         for idx in self._internal_idx:
@@ -151,6 +152,8 @@ class Brain:
         self._refractory_mask = np.zeros(net.n_nodes, dtype=np.bool_)
         self._refractory_mask[self._internal_idx] = True
         self._refractory_mask[self._memory_idx] = True
+        self._refractory_mask[self._gate_idx] = True
+        self._refractory_mask[self._gaze_idx] = True
 
         # Cached per-edge cortical layer classification (invalidated on edge count change)
         self._edge_layer_cache: np.ndarray | None = None
@@ -306,21 +309,22 @@ class Brain:
         self.net._csr_dirty = True
 
     def decorrelate_layers(self, eta: float = 0.01, sim_threshold: float = 0.4):
-        """Apply anti-Hebbian lateral decorrelation to each cortical layer.
+        """Apply anti-Hebbian lateral decorrelation with layer-specific strength.
 
-        Should be called once per stimulus presentation (not every step).
-        Pushes co-active neurons' weight vectors apart, preventing the
-        representational collapse where all neurons converge to detecting
-        the same features.
-
-        Returns total number of repelled pairs across all layers.
+        L2 gets stronger decorrelation to counteract the trace rule's
+        convergence pressure. L1 and L3 use the default parameters.
         """
         total = 0
-        for layer_idx in (self._l1_idx, self._l2_idx, self._l3_idx):
+        layer_params = [
+            (self._l1_idx, eta, sim_threshold),
+            (self._l2_idx, eta * 3.0, max(sim_threshold - 0.1, 0.15)),
+            (self._l3_idx, eta, sim_threshold),
+        ]
+        for layer_idx, layer_eta, layer_thresh in layer_params:
             if len(layer_idx) > 0:
                 total += lateral_decorrelation(
                     self.net, layer_idx,
-                    eta=eta, sim_threshold=sim_threshold,
+                    eta=layer_eta, sim_threshold=layer_thresh,
                 )
         return total
 
@@ -366,6 +370,33 @@ class Brain:
             mask[edge_layers == 0] = False
 
         self._edge_plastic_cache = mask
+        return mask
+
+    def _get_edge_l1_to_l2(self, ne: int) -> np.ndarray:
+        """Cached boolean mask: True for edges where src is L1 and dst is L2."""
+        cached = getattr(self, '_edge_l1_to_l2_cache', None)
+        if cached is not None and len(cached) == ne:
+            return cached
+        l1_reg = list(Region).index(Region.LOCAL_DETECT)
+        l2_reg = list(Region).index(Region.MID_LEVEL)
+        src_is_l1 = self.net.regions[self.net._edge_src[:ne]] == l1_reg
+        dst_is_l2 = self.net.regions[self.net._edge_dst[:ne]] == l2_reg
+        mask = src_is_l1 & dst_is_l2
+        self._edge_l1_to_l2_cache = mask
+        return mask
+
+    def _get_edge_into_l3(self, ne: int) -> np.ndarray:
+        """Cached boolean mask: True for edges where dst is L3 (Kenyon cells).
+
+        Used to freeze PN->KC (L2->L3, L1->L3, sensory->L3) plasticity
+        after infancy — the random conjunction wiring IS the representation.
+        """
+        cached = getattr(self, '_edge_into_l3_cache', None)
+        if cached is not None and len(cached) == ne:
+            return cached
+        l3_reg = list(Region).index(Region.ABSTRACT)
+        mask = self.net.regions[self.net._edge_dst[:ne]] == l3_reg
+        self._edge_into_l3_cache = mask
         return mask
 
     def _get_edge_layer_class(self) -> np.ndarray:
@@ -426,11 +457,22 @@ class Brain:
         # Update stage manager and sync setpoints
         self.stage_manager.step(n_steps)
         sp = self.stage_manager.current_setpoints()
+
+        # Mushroom body: freeze PN->KC (input to L3) plasticity after infancy.
+        # The sparse random wiring IS the representation — learning happens
+        # at KC->MBON (L3->MOTOR) via DA-gated eligibility traces.
+        if learn and self.stage_manager.current_stage not in ("infancy",):
+            into_l3 = self._get_edge_into_l3(ne)
+            if edge_plastic is self._edge_plastic_cache:
+                edge_plastic = edge_plastic.copy()
+            edge_plastic[into_l3] = False
         self.homeostasis.setpoints = sp
 
         # L1 critical period depends on stage — invalidate during transitions
         if self.stage_manager.is_transitioning:
             self._edge_plastic_cache = None
+            self._edge_l1_to_l2_cache = None
+            self._edge_into_l3_cache = None
 
         # Sync developmental parameters from genetic clock
         self.neuromod.da_baseline = sp.da_baseline
@@ -473,7 +515,33 @@ class Brain:
             self.net.adapt_rate, 0.1,
             self._col_pool, self._col_sizes, self._col_offsets,
             self._n_cols, sp.wta_active_frac,
-            self._memory_idx, max(1, len(self._memory_idx) // 3),
+            np.concatenate([self._memory_idx, self._gate_idx]),
+            max(1, (len(self._memory_idx) + len(self._gate_idx)) // 3),
+        )
+
+        _tail_args = (
+            self._motor_start, self._n_motor_cells, NUM_COLORS,
+            edge_plastic,
+            self.net._edge_eligibility[:ne], self.genome.elig_decay,
+            self._refractory_mask,
+            self.genome.eta_local * sp.plasticity_rate,
+            self._r_pre_wta,
+            self._node_col_id,
+            self._col_mean_r,
+            self.homeostasis.ema_rate_dendritic,
+            csr_indptr, csr_indices, csr_data,
+        )
+
+        # Temporal trace rule for L1->L2 invariance learning.
+        # Active from late_infancy onward (L1 must be stable first).
+        stage = self.stage_manager.current_stage
+        _use_trace = stage not in ("infancy",)
+        _trace_kwargs = dict(
+            r_trace=self.net.r_trace,
+            trace_decay=self.genome.trace_decay,
+            edge_is_l1_to_l2=self._get_edge_l1_to_l2(ne),
+            use_trace_rule=_use_trace,
+            trace_contrast_eta=self.genome.trace_contrast_eta,
         )
 
         if clamp_sensory and has_signal:
@@ -489,38 +557,39 @@ class Brain:
 
             for s_i in range(n_steps):
                 run_steps_plastic(
-                    *_kernel_args,
-                    True, n, 1,
-                    noise[s_i:s_i+1],
-                    self._motor_start, self._n_motor_cells, NUM_COLORS,
-                    edge_plastic,
-                    self.net._edge_eligibility[:ne], self.genome.elig_decay,
-                    self._refractory_mask,
-                    self.genome.eta_local * sp.plasticity_rate,
-                    self._r_pre_wta,
-                    self._node_col_id,
-                    self._col_mean_r,
-                    self.homeostasis.ema_rate_dendritic,
-                    csr_indptr, csr_indices, csr_data,
+                    *_kernel_args, True, n, 1, noise[s_i:s_i+1],
+                    *_tail_args, **_trace_kwargs,
                 )
                 self.net.V[color_idx] = color_vals
                 self.net.r[color_idx] = color_vals
         else:
             run_steps_plastic(
-                *_kernel_args,
-                has_signal, n, n_steps,
-                noise,
-                self._motor_start, self._n_motor_cells, NUM_COLORS,
-                edge_plastic,
-                self.net._edge_eligibility[:ne], self.genome.elig_decay,
-                self._refractory_mask,
-                self.genome.eta_local * sp.plasticity_rate,
-                self._r_pre_wta,
-                self._node_col_id,
-                self._col_mean_r,
-                self.homeostasis.ema_rate_dendritic,
-                csr_indptr, csr_indices, csr_data,
+                *_kernel_args, has_signal, n, n_steps, noise,
+                *_tail_args, **_trace_kwargs,
             )
+
+        # APL feedback: mushroom body global inhibition for L3/Kenyon cells.
+        # Only keep the top-k active KCs where k = target_sparseness * n_l3.
+        # This mimics the biological APL: a single inhibitory neuron driven
+        # by total KC activity that suppresses all but the most active KCs.
+        if len(self._l3_idx) > 0:
+            l3_r = self.net.r[self._l3_idx]
+            k = max(1, int(self.genome.apl_target_sparseness * len(self._l3_idx)))
+            n_active = int((l3_r > 0.01).sum())
+            if n_active > k:
+                thresh = np.partition(l3_r, -k)[-k]
+                suppress = l3_r < thresh
+                self.net.r[self._l3_idx[suppress]] *= 0.001
+
+        # Gaze WTA: strict 1-winner among gaze neurons (oculomotor selection).
+        # Applied post-kernel so gaze reflects the final rates of each step
+        # block. With only 8 neurons this is negligible overhead.
+        if len(self._gaze_idx) > 0:
+            gaze_r = self.net.r[self._gaze_idx] + self._gaze_bias
+            winner = int(np.argmax(gaze_r))
+            for gi, idx in enumerate(self._gaze_idx):
+                if gi != winner:
+                    self.net.r[idx] *= 0.001
 
         # Restore DA-gated memory weights after kernel.
         if saved_mem_w is not None:
@@ -534,6 +603,13 @@ class Brain:
 
         # EMA tracking (continuous) — scaling/intrinsic deferred to sleep
         self.homeostasis.step()
+
+        # L2 excitability floor: boost quiet neurons so they can respond
+        # to novel patterns (homeostatic intrinsic plasticity, Turrigiano 2011).
+        if len(self._l2_idx) > 0:
+            l2_ema = self.homeostasis.ema_rate_dendritic[self._l2_idx]
+            quiet = l2_ema < 0.01
+            self.net.excitability[self._l2_idx[quiet]] += 0.001
 
         # Continuous synaptogenesis — modulated by density ceiling + activity demand.
         # Stage setpoints provide the base/max rate; actual rate scales down
@@ -580,16 +656,26 @@ class Brain:
                     self._memory_gate_cache = None
                     self._sensory_motor_cache = None
                     self._edge_layer_cache = None
+                    self._edge_l1_to_l2_cache = None
+                    self._edge_into_l3_cache = None
 
-        # Copy pathway maintenance: re-pin instinct weights every step.
-        # Without this, SHY sleep downscaling erodes them nightly.
-        # When copy_strength=1.0 (infancy), weights stay at 2.0.
-        # When copy_strength decays (childhood), weights decay with it.
+        # Copy pathway maintenance. During infancy/late_infancy the instinct
+        # is re-pinned every step to prevent SHY erosion. In childhood, the
+        # copy pathway becomes plastic: consolidation drops from 20 -> 2
+        # and repinning stops, allowing CHL to refine or weaken copy weights
+        # based on task-specific reward.
         copy_mask = self.net._edge_consolidation[:ne] >= 20.0
-        if copy_mask.any():
-            target_w = 5.0 * sp.copy_strength
-            self.net._edge_w[:ne][copy_mask] = target_w
+        if stage in ("infancy", "late_infancy"):
+            if copy_mask.any():
+                target_w = 5.0 * sp.copy_strength
+                self.net._edge_w[:ne][copy_mask] = target_w
+                self.net._csr_dirty = True
+        elif copy_mask.any():
+            # Childhood/adolescence: release copy pathway for learning.
+            # Reduce consolidation once (20 -> 2), then never repin again.
+            self.net._edge_consolidation[:ne][copy_mask] = 2.0
             self.net._csr_dirty = True
+            self._sensory_motor_cache = None
 
         # DA decay toward baseline
         self.neuromod.decay()
@@ -775,60 +861,125 @@ class Brain:
             max_h=self.net.max_h, max_w=self.net.max_w,
         )
 
+    # ── Gaze (active vision) ─────────────────────────────────────────
+
+    def read_gaze(self) -> int:
+        """Return the currently selected gaze slot (argmax of gaze rates)."""
+        if len(self._gaze_idx) == 0:
+            return 0
+        gaze_r = self.net.r[self._gaze_idx] + self._gaze_bias
+        return int(np.argmax(gaze_r))
+
+    def apply_gaze(self, display_buffer) -> int:
+        """Read gaze winner, fetch that slot's grid, inject into sensory.
+
+        Returns the selected slot index.
+        """
+        slot = self.read_gaze()
+        grid = display_buffer.get_slot(slot)
+        signal = grid_to_signal(grid, max_h=self.net.max_h,
+                                max_w=self.net.max_w)
+        self.inject_signal(signal)
+        return slot
+
+    def guide_gaze(self, slot_idx: int, strength: float = 1.0) -> None:
+        """Bias a specific gaze neuron to win WTA (teacher-guided saccade).
+
+        strength controls how strongly the teacher overrides the network's
+        own gaze preference. 1.0 = full control, 0.0 = no guidance.
+        """
+        self._gaze_bias[:] = 0.0
+        if 0 <= slot_idx < len(self._gaze_idx) and strength > 0:
+            self._gaze_bias[slot_idx] = strength * 2.0
+
+    def clear_gaze_bias(self) -> None:
+        """Remove teacher gaze guidance."""
+        self._gaze_bias[:] = 0.0
+
+    def step_with_gaze(self, display_buffer, gaze_logger=None,
+                       n_steps: int = 10, learn: bool = True,
+                       clamp_sensory: bool = False) -> int:
+        """Step the brain and apply gaze consequence in one call.
+
+        Runs a normal step (motor and gaze neurons both fire and compete),
+        then reads the gaze winner and injects the corresponding display
+        buffer slot as the next sensory input. Returns the selected slot.
+
+        This is the standard "perceive through gaze" tick: the network's
+        oculomotor output determines what it sees on the next cycle, just
+        as biological saccades shift retinal input between fixations.
+        """
+        self.step(n_steps=n_steps, learn=learn, clamp_sensory=clamp_sensory)
+        slot = self.apply_gaze(display_buffer)
+        if gaze_logger is not None:
+            stype = display_buffer.slot_types[slot]
+            motor_nodes = self.net.output_nodes
+            motor_active = float(self.net.r[motor_nodes].mean()) > 0.05
+            gaze_logger.record(self.age, slot, stype, motor_event=motor_active)
+        return slot
+
     # ------------------------------------------------------------------
     #  Motor babbling & mimicry
     # ------------------------------------------------------------------
 
     def motor_babble(self, noise_std: float = 0.5,
-                     observe_steps: int = 20) -> np.ndarray:
-        """Random motor exploration with dual-channel feedback.
+                     observe_steps: int = 20,
+                     display_buffer=None,
+                     gaze_logger=None) -> np.ndarray:
+        """Random motor exploration with gaze-routed visual feedback.
 
-        Phase A — inject noise, let motor WTA pick winners.
-        Phase B — proprioceptive: hold motor at output, let feedback
-                  edges propagate the signal internally (efference copy).
-        Phase C — visual: decode motor -> grid -> full perception ->
-                  inject as sensory.  The network "sees" what it did.
-        Phase D — rest.
+        Phase A — inject noise, let motor fire. Instinct connections
+                  excite the answer gaze neuron during motor activity.
+        Phase B — discrete saccade: read gaze winner (biased toward
+                  answer by instinct), inject that slot as stable sensory,
+                  observe for the full fixation period.
+        Phase C — rest.
         """
         motor_nodes = self.net.output_nodes
 
-        # Phase A: random activation
+        # Phase A: random motor activation
         self.net.V[motor_nodes] += self.rng.normal(0, noise_std, len(motor_nodes))
         self.step(n_steps=5)
 
         motor_rates = self.net.r[motor_nodes].copy()
         grid = self.read_motor(self.net.max_h, self.net.max_w)
 
-        # Phase B: proprioceptive feedback (efference copy)
-        # learn=False: corollary discharge suppresses sensory plasticity
-        saved_v = self.net.V[motor_nodes].copy()
-        self.net.r[motor_nodes] = motor_rates
-        self.step(n_steps=5, learn=False)
-        self.net.V[motor_nodes] = saved_v
+        # Phase B: discrete gaze selection + stable fixation
+        if display_buffer is not None:
+            display_buffer.write_answer(grid)
+            slot = self.read_gaze()
+            fixation_grid = display_buffer.get_slot(slot)
+            signal = grid_to_signal(fixation_grid, max_h=self.net.max_h,
+                                    max_w=self.net.max_w)
+            self.inject_signal(signal)
+            if gaze_logger is not None:
+                stype = display_buffer.slot_types[slot]
+                gaze_logger.record(self.age, slot, stype,
+                                   motor_event=True)
+        else:
+            signal = grid_to_signal(grid, max_h=self.net.max_h,
+                                    max_w=self.net.max_w)
+            self.inject_signal(signal)
 
-        # Phase C: visual feedback through full perception
-        # learn=False: L1 propagates but doesn't learn from self-generated input
-        feedback = grid_to_signal(grid, max_h=self.net.max_h,
-                                  max_w=self.net.max_w)
-        self.inject_signal(feedback)
         self.step(n_steps=observe_steps, learn=False)
 
-        # Phase D: rest
+        # Phase C: rest
         self.clear_signal()
+        self.clear_gaze_bias()
         self.step(n_steps=5)
         return grid
 
     def stimulus_with_feedback(self, signal: np.ndarray,
-                               observe_steps: int = 25) -> np.ndarray:
-        """Mimicry: show a stimulus, let copy pathway fire, feed back the
-        motor output so the network sees what it produced.
+                               observe_steps: int = 25,
+                               display_buffer=None,
+                               gaze_logger=None) -> np.ndarray:
+        """Mimicry: show a stimulus, let copy pathway fire, then observe
+        the motor output via a single discrete gaze saccade.
 
-        The copy pathway fires within ~3 steps and produces the correct
-        output. We capture that output quickly, then clamp motor to the
-        correct state while L1/L2 continue activating. This ensures
-        Hebbian co-activation pairs the right sensory features with the
-        right motor output — like a reflexive motor program the infant
-        can't override yet.
+        The copy pathway fires within ~3 steps. Motor is clamped so
+        the instinct edges bias gaze toward the answer canvas. After
+        mimicry reward, gaze selects a slot and sensory is held stable
+        for the fixation period.
         """
         motor_nodes = self.net.output_nodes
 
@@ -836,7 +987,6 @@ class Brain:
         self.inject_signal(signal)
         self.step(n_steps=5)
 
-        # Capture the copy pathway's output before internal pathways corrupt it
         motor_rates = self.net.r[motor_nodes].copy()
         grid = self.read_motor(self.net.max_h, self.net.max_w)
 
@@ -848,25 +998,32 @@ class Brain:
             self.net.r[motor_nodes] = motor_rates
             self.step(n_steps=1)
 
-        # Mimicry reward: cash in eligibility traces on sensory→motor edges
-        # NOW, while traces are fresh (elig_decay=0.85 means they vanish
-        # within ~30 steps). The copy pathway guaranteed correct co-activation
-        # between sensory color nodes and matching motor color nodes.
         self.apply_mimicry_reward(da=1.0)
 
-        # Proprioceptive phase: hold motor at output state
-        # learn=False: corollary discharge during self-generated feedback
-        self.net.r[motor_nodes] = motor_rates
-        self.step(n_steps=5, learn=False)
+        # Phase 3: discrete gaze saccade + stable fixation.
+        # Motor is still active from Phase 2, so instinct edges bias
+        # gaze toward the answer slot. Read gaze once, fixate.
+        if display_buffer is not None:
+            display_buffer.write_answer(grid)
+            slot = self.read_gaze()
+            fixation_grid = display_buffer.get_slot(slot)
+            fb_signal = grid_to_signal(fixation_grid,
+                                       max_h=self.net.max_h,
+                                       max_w=self.net.max_w)
+            self.inject_signal(fb_signal)
+            if gaze_logger is not None:
+                stype = display_buffer.slot_types[slot]
+                gaze_logger.record(self.age, slot, stype,
+                                   motor_event=True)
+        else:
+            feedback = grid_to_signal(grid, max_h=self.net.max_h,
+                                      max_w=self.net.max_w)
+            self.inject_signal(feedback)
 
-        # Visual feedback: see own output through full perception
-        # learn=False: don't corrupt L1 features with self-generated input
-        feedback = grid_to_signal(grid, max_h=self.net.max_h,
-                                  max_w=self.net.max_w)
-        self.inject_signal(feedback)
         self.step(n_steps=observe_steps, learn=False)
 
         self.clear_signal()
+        self.clear_gaze_bias()
         self.step(n_steps=5)
         return grid
 
@@ -908,6 +1065,8 @@ class Brain:
             self._memory_gate_cache = None
             self._sensory_motor_cache = None
             self._edge_layer_cache = None
+            self._edge_l1_to_l2_cache = None
+            self._edge_into_l3_cache = None
 
         # Homeostatic corrections run during sleep, not waking.
         self.homeostasis.sleep_correction()

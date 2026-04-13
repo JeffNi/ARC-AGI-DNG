@@ -160,6 +160,47 @@ def cross_shape(h: int, w: int, rng: np.random.Generator) -> np.ndarray:
     return grid
 
 
+# ── Transformation helpers for diagnostic probes ──────────────
+
+def shifted_variant(grid: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Shift grid by a random offset, filling vacated cells with the mode color."""
+    h, w = grid.shape
+    dy = rng.integers(-h // 3, h // 3 + 1)
+    dx = rng.integers(-w // 3, w // 3 + 1)
+    if dy == 0 and dx == 0:
+        dy = 1
+    vals, counts = np.unique(grid, return_counts=True)
+    bg = int(vals[counts.argmax()])
+    out = np.full_like(grid, bg)
+    src_r = slice(max(0, -dy), min(h, h - dy))
+    src_c = slice(max(0, -dx), min(w, w - dx))
+    dst_r = slice(max(0, dy), min(h, h + dy))
+    dst_c = slice(max(0, dx), min(w, w + dx))
+    out[dst_r, dst_c] = grid[src_r, src_c]
+    return out
+
+
+def recolored_variant(grid: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Remap every color to a different color, preserving spatial structure."""
+    present = np.unique(grid)
+    perm = rng.permutation(NUM_COLORS)
+    while any(perm[c] == c for c in present):
+        perm = rng.permutation(NUM_COLORS)
+    return perm[grid].astype(np.int32)
+
+
+def random_variant(grid: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply a random transformation (shift, recolor, or rotate)."""
+    choice = int(rng.integers(0, 3))
+    if choice == 0:
+        return shifted_variant(grid, rng)
+    elif choice == 1:
+        return recolored_variant(grid, rng)
+    else:
+        k = int(rng.integers(1, 4))
+        return np.rot90(grid, k).copy()
+
+
 # All generators with equal probability by default
 GENERATORS: list[Callable] = [
     solid_fill,

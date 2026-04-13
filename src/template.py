@@ -44,20 +44,24 @@ def create_dng(
     n_motor = n_cells * NUM_COLORS
     n_int = genome.n_internal
     n_mem = genome.n_memory
+    n_gate = genome.n_gate
+    n_gaze = genome.n_gaze
 
     # Split internal into 3 cortical layers
     n_l1 = int(n_int * genome.frac_layer1)
     n_l2 = int(n_int * genome.frac_layer2)
     n_l3 = n_int - n_l1 - n_l2
 
-    n_total = n_sensory + n_int + n_mem + n_motor
+    n_total = n_sensory + n_int + n_mem + n_gate + n_gaze + n_motor
 
     sensory_start = 0
     l1_start = n_sensory
     l2_start = n_sensory + n_l1
     l3_start = n_sensory + n_l1 + n_l2
     memory_start = n_sensory + n_int
-    motor_start = n_sensory + n_int + n_mem
+    gate_start = n_sensory + n_int + n_mem
+    gaze_start = n_sensory + n_int + n_mem + n_gate
+    motor_start = n_sensory + n_int + n_mem + n_gate + n_gaze
 
     sensory = np.arange(sensory_start, sensory_start + n_sensory)
     layer1 = np.arange(l1_start, l1_start + n_l1)
@@ -65,6 +69,8 @@ def create_dng(
     layer3 = np.arange(l3_start, l3_start + n_l3)
     all_internal = np.arange(l1_start, l1_start + n_int)
     memory = np.arange(memory_start, memory_start + n_mem)
+    gate = np.arange(gate_start, gate_start + n_gate)
+    gaze = np.arange(gaze_start, gaze_start + n_gaze)
     motor = np.arange(motor_start, motor_start + n_motor)
 
     # Node types: E/I split for all internal layers
@@ -74,6 +80,8 @@ def create_dng(
     internal_types = [_NTYPE_E] * n_exc + [_NTYPE_I] * n_inhib
     rng.shuffle(internal_types)
     node_types[l1_start:l1_start + n_int] = internal_types
+    node_types[gate] = _NTYPE_I  # gate neurons are all inhibitory (BG indirect pathway)
+    node_types[gaze] = _NTYPE_E  # gaze neurons are excitatory (oculomotor WTA)
 
     # Regions — assign each layer its own region
     _reg = list(Region)
@@ -83,6 +91,8 @@ def create_dng(
     regions[layer2] = _reg.index(Region.MID_LEVEL)
     regions[layer3] = _reg.index(Region.ABSTRACT)
     regions[memory] = _reg.index(Region.MEMORY)
+    regions[gate] = _reg.index(Region.GATE)
+    regions[gaze] = _reg.index(Region.GAZE)
     regions[motor] = _reg.index(Region.MOTOR)
 
     # Leak rates per node type
@@ -124,6 +134,8 @@ def create_dng(
         input_nodes=sensory,
         output_nodes=motor,
         memory_nodes=memory,
+        gate_nodes=gate,
+        gaze_nodes=gaze,
         column_ids=column_ids,
         n_columns=0,
         max_h=grid_h,
@@ -155,22 +167,40 @@ def create_dng(
     # Corticocortical feedforward synapses are individually stronger
     # than thalamocortical ones because they carry post-WTA sparse
     # signals that need amplification at each stage.
-    ff_ws = ws * 3.0
+    ff_ws = ws * 8.0
     _inter_layer_rf_edges(
         net, layer1, layer2, grid_h, grid_w, n_cells,
         rf_radius=3, connection_prob=0.15,
         ws=ff_ws, rng=rng,
     )
 
-    # LAYER 2 -> LAYER 3: broad sampling (L3 is non-topographic,
-    # each L3 neuron receives from a random subset of L2).
-    fan_l2_l3 = _fan_in(0.20, n_l2, cap)
+    # L3 = Mushroom body / Kenyon cells. Expansion recoding layer.
+    # Each KC samples a SPARSE random subset of inputs, creating unique
+    # conjunction detectors. Pattern separation comes from the randomness
+    # and sparseness of this wiring, not from learning.
+    # Bee: ~7 PN inputs per KC out of ~800 PNs. We use ~15 per KC.
+    # Weight scale is lower so individual inputs are subthreshold —
+    # KCs require coincident activation of multiple inputs to fire.
+    # Conjunction selectivity comes from SPARSE connectivity (few inputs per KC),
+    # not from reduced weight scale. Use full ff_ws so KCs can actually fire
+    # when their sparse input set is active.
+
+    # SENSORY -> L3/KC: very sparse direct sampling
+    fan_s_l3 = _fan_in(0.005, n_sensory, cap)
+    _fan_in_edges(net, sensory, layer3, fan_s_l3, ws * 2.0, rng)
+
+    # L1 -> L3/KC: sparse random skip (each KC samples ~13 L1 neurons)
+    fan_l1_l3 = _fan_in(0.03, n_l1, cap)
+    _fan_in_edges(net, layer1, layer3, fan_l1_l3, ff_ws, rng)
+
+    # L2 -> L3/KC: sparse random projection (each KC samples ~15 L2 neurons)
+    fan_l2_l3 = _fan_in(0.05, n_l2, cap)
     _fan_in_edges(net, layer2, layer3, fan_l2_l3, ff_ws, rng)
 
     # LAYER 3 -> MOTOR: learned output pathway
     _local_rf_edges(
         net, motor_start, layer3, grid_h, grid_w, n_cells,
-        rf_radius=2, long_range_frac=0.35, ws=ws * 0.01 / rf_prob**0.5, rng=rng,
+        rf_radius=2, long_range_frac=0.35, ws=ws * 0.1 / rf_prob**0.5, rng=rng,
         direction='internal_to_motor',
         n_sensory=n_sensory,
         connection_prob=rf_prob,
@@ -183,7 +213,7 @@ def create_dng(
     _inter_layer_rf_edges(
         net, layer1, motor, grid_h, grid_w, n_cells,
         rf_radius=2, connection_prob=0.10,
-        ws=ws * 0.01, rng=rng,
+        ws=ws * 0.1, rng=rng,
     )
 
     # L2 -> MOTOR: topographic output from mid-level features.
@@ -191,7 +221,7 @@ def create_dng(
     _inter_layer_rf_edges(
         net, layer2, motor, grid_h, grid_w, n_cells,
         rf_radius=3, connection_prob=0.10,
-        ws=ws * 0.01, rng=rng,
+        ws=ws * 0.1, rng=rng,
     )
 
     # ═══════════════════════════════════════════════════════════════════
@@ -239,17 +269,59 @@ def create_dng(
     fan_s2m = _fan_in(genome.density_sensory_to_motor, n_sensory, cap)
     _fan_in_edges(net, sensory, motor, fan_s2m, ws * 0.1, rng)
 
-    # MEMORY circuit — wired to Layer 3 (abstract/reasoning)
-    # Memory self-connections are strong (bistable attractors).
-    # Memory↔L3 connections are moderate — L3 should be driven
-    # primarily by L2 feedforward, with memory providing context.
+    # MEMORY circuit — tightly coupled to L3 (mushroom body architecture).
+    # In biology, Kenyon cells and their output neurons form one functional
+    # unit. Memory and L3 share strong bidirectional connections at the
+    # same weight scale as memory self-connections.
     mem_ws = ws * 5
     mem_fan_in = min(max(10, n_mem // 2), cap)
     _fan_in_edges(net, memory, memory, mem_fan_in, mem_ws, rng)
-    _fan_in_edges(net, layer3, memory, min(max(10, n_l3 // 3), cap), ws * 2, rng)
-    _fan_in_edges(net, memory, layer3, min(max(10, n_mem // 2), cap), ws * 2, rng)
+    _fan_in_edges(net, layer3, memory, min(max(15, n_l3 // 2), cap), mem_ws, rng)
+    _fan_in_edges(net, memory, layer3, min(max(15, n_mem // 2), cap), mem_ws, rng)
     _fan_in_edges(net, memory, motor, min(max(10, n_mem // 2), cap), ws * 0.2, rng)
-    _fan_in_edges(net, sensory, memory, min(max(5, n_sensory // 15), cap), ws, rng)
+    _fan_in_edges(net, sensory, memory, min(max(10, n_sensory // 5), cap), ws * 2, rng)
+
+    # GATE circuit — basal ganglia analog for motor program selection.
+    # Gate neurons receive cortical context (L2/L3) and project inhibitorily
+    # to motor neurons. When active, they suppress the copy pathway's motor
+    # output, allowing cortical pathways to drive motor instead.
+    # Starts quiet (L2/L3 undeveloped at birth), learns via eligibility + DA.
+    if n_gate > 0:
+        gate_fan = min(max(5, n_gate // 2), cap)
+        _fan_in_edges(net, layer2, gate, gate_fan, ws * 2.0, rng)
+        _fan_in_edges(net, layer3, gate, gate_fan, ws * 2.0, rng)
+        # Gate -> motor: sign handled by _fan_in_edges (gate neurons are
+        # all inhibitory, so weights flip to negative automatically).
+        gate_motor_fan = min(max(10, n_motor // 20), cap)
+        _fan_in_edges(net, gate, motor, gate_motor_fan, ws * 10.0, rng)
+
+    # GAZE circuit — oculomotor neurons for active vision.
+    # Each gaze neuron represents one display slot. WTA competition
+    # selects which slot the network currently observes. Driven by
+    # higher cortical areas (L2/L3) and memory, NOT by sensory input
+    # (avoids trivial fixation loops where seeing something locks gaze).
+    if n_gaze > 0:
+        gaze_fan = min(max(3, n_gaze), cap)
+        _fan_in_edges(net, layer2, gaze, gaze_fan, ws * 1.0, rng)
+        _fan_in_edges(net, layer3, gaze, gaze_fan, ws * 2.0, rng)
+        _fan_in_edges(net, memory, gaze, gaze_fan, ws * 1.5, rng)
+
+        # INSTINCT: Motor activity -> look at answer canvas.
+        # When grid-motor neurons fire (the network "drew" something),
+        # the answer-slot gaze neuron gets excited, biasing the next
+        # saccade toward the answer canvas. This is the sensorimotor
+        # contingency every infant has: act -> look at the result.
+        # Consolidated during infancy, decays as learned gaze takes over.
+        answer_gaze_idx = int(gaze[-1])
+        fan_motor_gaze = min(50, n_motor)
+        motor_sample = rng.choice(motor, fan_motor_gaze, replace=False)
+        instinct_edge_start = net._edge_count
+        motor_gaze_src = motor_sample.astype(np.int32)
+        motor_gaze_dst = np.full(fan_motor_gaze, answer_gaze_idx, dtype=np.int32)
+        motor_gaze_w = np.full(fan_motor_gaze, ws * 3.0)
+        net.add_edges_batch(motor_gaze_src, motor_gaze_dst, motor_gaze_w)
+        instinct_edge_end = net._edge_count
+        net._edge_consolidation[instinct_edge_start:instinct_edge_end] = 10.0
 
     # INSTINCT: Copy pathway — sensory COLOR nodes -> motor nodes (1:1)
     # Brainstem reflex: strong, consolidated, re-pinned every step.

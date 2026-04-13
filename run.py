@@ -103,9 +103,12 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
     """Probe representational similarity for a layer.
 
     Returns dict with:
-      sim_v:  mean pairwise Pearson r on V (membrane potential)
-      sim_r:  mean pairwise Pearson r on r (post-WTA firing rate)
-      sim_col: mean within-column sim on r (are column-mates differentiating?)
+      sim_v:   mean pairwise Pearson r on V (membrane potential)
+      sim_r:   mean pairwise Pearson r on r (post-WTA firing rate)
+      sim_col: mean within-column sim on r
+      uniq:    total unique neurons active across all probes
+      jaccard: mean pairwise Jaccard similarity of active neuron sets
+      n_active: mean number of active neurons per probe
     """
     from src.stimuli import (
         rectangle, l_shape, random_scatter,
@@ -125,6 +128,7 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
     saved_exc = brain.net.excitability.copy()
 
     pats_v, pats_r = [], []
+    active_sets: list[set[int]] = []
     for gen in generators[:n_probes]:
         grid = gen(h, w, rng)
         signal = grid_to_signal(grid, max_h=h, max_w=w)
@@ -133,18 +137,16 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
         brain.net.adaptation[:] = 0.0
         brain.clear_signal()
         brain.inject_signal(signal)
-        brain.step(n_steps=20)
+        brain.step(n_steps=20, learn=False)
+        layer_r = brain.net.r[mask].copy()
         pats_v.append(brain.net.V[mask].copy())
-        pats_r.append(brain.net.r[mask].copy())
+        pats_r.append(layer_r)
+        active_sets.append(set(int(i) for i in np.where(layer_r > 0.01)[0]))
 
-    brain.net._edge_count = ne
     brain.net.V[:] = saved_V
     brain.net.r[:] = saved_r
     brain.net.adaptation[:] = saved_adapt
     brain.net.f[:] = saved_f
-    brain.net._edge_w[:ne] = saved_w
-    brain.net._edge_eligibility[:ne] = saved_elig
-    brain.net.excitability[:] = saved_exc
     brain.clear_signal()
 
     def _mean_pairwise(patterns):
@@ -161,8 +163,21 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
     sim_v = _mean_pairwise(pats_v)
     sim_r = _mean_pairwise(pats_r)
 
-    # Within-column similarity: for each column, compare its neurons'
-    # response vectors across stimuli. Low = good differentiation.
+    # Active set diversity (WTA-independent)
+    all_active = set().union(*active_sets) if active_sets else set()
+    uniq = len(all_active)
+    n_active = float(np.mean([len(s) for s in active_sets])) if active_sets else 0.0
+
+    jaccards = []
+    for i in range(len(active_sets)):
+        for j in range(i + 1, len(active_sets)):
+            a, b = active_sets[i], active_sets[j]
+            inter = len(a & b)
+            union = len(a | b)
+            jaccards.append(inter / union if union > 0 else 1.0)
+    jaccard = float(np.mean(jaccards)) if jaccards else 1.0
+
+    # Within-column similarity
     layer_indices = np.where(mask)[0]
     col_ids = brain.net.column_ids[layer_indices]
     unique_cols = np.unique(col_ids[col_ids >= 0])
@@ -172,12 +187,10 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
         col_neurons = np.where(col_ids == col)[0]
         if len(col_neurons) < 2:
             continue
-        # For each pair of neurons in this column, compute correlation
-        # of their response profiles across stimuli
         responses = np.array([
             [pats_r[s][n] for s in range(len(pats_r))]
             for n in col_neurons
-        ])  # (n_neurons_in_col, n_stimuli)
+        ])
         for a_i in range(len(col_neurons)):
             for b_i in range(a_i + 1, len(col_neurons)):
                 ra = responses[a_i] - responses[a_i].mean()
@@ -188,7 +201,10 @@ def _probe_layer_sim(brain: Brain, h: int, w: int, mask: np.ndarray,
 
     sim_col = float(np.mean(col_sims)) if col_sims else 0.0
 
-    return {"sim_v": sim_v, "sim_r": sim_r, "sim_col": sim_col}
+    return {
+        "sim_v": sim_v, "sim_r": sim_r, "sim_col": sim_col,
+        "uniq": uniq, "jaccard": jaccard, "n_active": n_active,
+    }
 
 
 def _birth_health_check(brain: Brain, monitor: Monitor) -> bool:

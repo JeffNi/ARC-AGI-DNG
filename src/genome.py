@@ -19,20 +19,26 @@ class Genome:
     max_w: int = 30
 
     # ── Internal processing region ────────────────────────────────────
-    n_internal: int = 500
+    n_internal: int = 2000
     frac_inhibitory: float = 0.2
     frac_modulatory: float = 0.05
     frac_memory: float = 0.1
 
     # ── Cortical layer fractions (of n_internal) ──────────────────────
-    # Bottom-heavy hierarchy mirrors biology: most neurons in early
-    # visual areas, fewer in association/abstract areas.
-    frac_layer1: float = 0.60   # Local feature combination (V4-like)
-    frac_layer2: float = 0.25   # Regional integration (IT-like)
-    frac_layer3: float = 0.15   # Abstract / reasoning (PFC-like)
+    # Bee-inspired: L3 is the mushroom body (expansion layer for pattern
+    # separation). L1 kept at 900 (proven stable). L2 = projection neurons.
+    frac_layer1: float = 0.45   # Optic lobe — sensory feature extraction
+    frac_layer2: float = 0.15   # Projection neurons — intermediate features
+    frac_layer3: float = 0.40   # Mushroom body / Kenyon cells — pattern separation
 
     # ── Long-term memory pool ─────────────────────────────────────────
     n_memory: int = 100
+
+    # ── Basal ganglia gate pool ────────────────────────────────────────
+    n_gate: int = 50
+
+    # ── Gaze (oculomotor) neurons ────────────────────────────────────
+    n_gaze: int = 8
 
     # ── Shared concept pool ───────────────────────────────────────────
     n_concept: int = 100
@@ -86,6 +92,14 @@ class Genome:
     elig_eta: float = 0.2
     elig_decay: float = 0.85
     eta_local: float = 0.005      # DA-independent Hebbian rate (NMDA-like, always on)
+
+    # ── Temporal trace for L1->L2 invariance learning ────────────────
+    trace_decay: float = 0.97     # slow EMA of post-synaptic rates (~30-step window)
+    trace_contrast_eta: float = 0.3  # heterosynaptic LTD strength (fraction of positive signal)
+
+    # ── APL (mushroom body global inhibition) ──────────────────────────
+    apl_target_sparseness: float = 0.10  # fraction of L3/KC neurons that should be active
+    apl_gain: float = 2.0               # strength of APL feedback inhibition
 
     # ── DA parameters ──────────────────────────────────────────────────
     da_baseline_obs: float = 0.2

@@ -21,8 +21,10 @@ from typing import Any
 import numpy as np
 
 from .brain import Brain
+from .display_buffer import DisplayBuffer
 from .encoding import grid_to_signal, pad_grid, NUM_COLORS
 from .episodic_memory import EpisodicMemory
+from .gaze_log import GazeLogger
 from .monitor import Monitor
 from .rule_verifiers import verify_rule
 
@@ -58,6 +60,8 @@ class Teacher:
         self,
         brain: Brain,
         monitor: Monitor,
+        display_buffer: DisplayBuffer | None = None,
+        gaze_logger: GazeLogger | None = None,
         task_dir: str = "micro_tasks",
         mastery_threshold: int = 3,
         retest_interval: int = 50,
@@ -67,6 +71,10 @@ class Teacher:
     ):
         self.brain = brain
         self.monitor = monitor
+        self.display_buffer = display_buffer or DisplayBuffer(
+            brain.net.max_h, brain.net.max_w,
+        )
+        self.gaze_logger = gaze_logger
         self.task_dir = Path(task_dir)
         self.mastery_threshold = mastery_threshold
         self.retest_interval = retest_interval
@@ -275,24 +283,38 @@ class Teacher:
             motor[i * NUM_COLORS + color] = 1.0
         return motor
 
+    def _gaze_step(self, slot_idx: int, n_steps: int,
+                   strength: float = 0.5, **step_kwargs) -> int:
+        """Guide gaze to a slot, apply it, step, and log.
+
+        Returns the slot the network actually fixated on (may differ
+        from slot_idx if guidance strength is low and the network
+        overrides).
+        """
+        self.brain.guide_gaze(slot_idx, strength)
+        actual_slot = self.brain.apply_gaze(self.display_buffer)
+        self.brain.step(n_steps=n_steps, **step_kwargs)
+        if self.gaze_logger:
+            stype = self.display_buffer.slot_types[actual_slot]
+            self.gaze_logger.record(self.brain.age, actual_slot, stype)
+        return actual_slot
+
     def run_task(self, task_type: str, task: dict) -> bool:
         """
-        Present a single task to the brain with iterative refinement.
+        Present a single task via display buffer + guided gaze.
+
+        Visual-only teaching -- no external motor injection. The copy
+        pathway drives motor neurons when the network sees the answer.
 
         Flow:
-          1. Sequential demos: for each pair, show input alone (L1/L2
-             encode it), then input+output together (L2/L3 encode the
-             transformation). Stored in episodic memory.
-          2. Episodic recall: flash the recalled output as a sensory
-             signal (hippocampal reactivation of sensory cortex). The
-             network must translate this into motor output on its own.
-          3. Attempt loop (max 3 tries):
-             a. Inject test input, run 10 steps, read motor output.
-             b. Binary reward: pass -> +DA, break. Fail -> -DA.
-             c. Correction: show correct answer, capture clamped
-                correlations for CHL error correction.
-             d. Rest before retry.
-          4. Consolidation: rest, spontaneous replay, sleep check.
+          1. Load task into display buffer (slots: [in1, out1, ...test, answer]).
+          2. Sequential demos: guide gaze to input slot, then output slot.
+             Copy pathway sees output and drives motor naturally.
+          3. Episodic recall.
+          4. Attempt loop (max 3 tries): guide gaze to test input,
+             read motor output, evaluate. If wrong: global DA + show
+             correct answer visually + CHL (free vs clamped).
+          5. Rest + consolidation.
         """
         h = self.brain.net.max_h
         w = self.brain.net.max_w
@@ -303,30 +325,30 @@ class Teacher:
 
         sp = self.brain.stage_manager.current_setpoints()
         n_demos = sp.n_demos
-        spotlight = sp.spotlight_strength
 
-        # --- Phase 1: Sequential demonstrations ---
+        # --- Load task into display buffer ---
+        n_loaded = self.display_buffer.load_task(task)
+        gaze_strength = 0.5  # moderate guidance during childhood
+
+        # --- Phase 1: Sequential demonstrations via gaze ---
+        # Visual only: guide gaze to input, then output. The copy pathway
+        # sees the output and drives motor neurons naturally -- no external
+        # motor injection needed.
         self.episodic_memory.clear()
         demo_pairs = pairs[:n_demos] if n_demos > 0 else []
-        for dp in demo_pairs:
+        for pair_idx, dp in enumerate(demo_pairs):
             dp_in = pad_grid(np.array(dp["input"], dtype=np.int32), h, w)
             dp_out = pad_grid(np.array(dp["output"], dtype=np.int32), h, w)
-
             self.episodic_memory.store(dp_in, dp_out)
 
-            sensory = self._build_spotlight_signal(dp_in, dp_out, h, w, spotlight)
-            motor = self._motor_signal_from_grid(dp_out, h, w)
+            in_slot = pair_idx * 2
+            out_slot = pair_idx * 2 + 1
 
-            # Phase A: input alone — L1/L2 encode the input pattern
-            self.brain.store_signal(sensory)
-            self.brain.inject_signal(sensory)
-            self.brain.step(n_steps=10)
-
-            # Phase B: input + output — L2/L3 encode the transformation
-            self.brain.inject_teaching_signal(sensory, motor)
-            self.brain.step(n_steps=15)
+            self._gaze_step(in_slot, n_steps=15, strength=gaze_strength)
+            self._gaze_step(out_slot, n_steps=20, strength=gaze_strength)
 
             self.brain.clear_signal()
+            self.brain.clear_gaze_bias()
             self.brain.step(n_steps=5)
 
         # --- Phase 2: Episodic recall (sensory, not motor) ---
@@ -344,9 +366,18 @@ class Teacher:
             self.brain.step(n_steps=5)
 
         # --- Phase 3: Attempt loop (max 3 tries) ---
+        # Visual-only teaching: network attempts freely, then sees the
+        # correct answer via gaze. CHL captures the contrast. Global DA
+        # signals overall accuracy; three-factor learning + CHL provide
+        # cell-level specificity.
+        test_slot = next(
+            (i for i, t in enumerate(self.display_buffer.slot_types)
+             if t == "test_input"),
+            0,
+        )
+        answer_slot = self.display_buffer.answer_slot
+
         motor_nodes = self.brain.net.output_nodes
-        test_signal = grid_to_signal(input_grid, max_h=h, max_w=w)
-        self.brain.store_signal(test_signal)
 
         correct = False
         n_attempts = 0
@@ -358,18 +389,23 @@ class Teacher:
         for attempt in range(max_attempts):
             n_attempts = attempt + 1
 
-            # Clear motor state before each attempt
             self.brain.net.V[motor_nodes] = 0.0
             self.brain.net.r[motor_nodes] = 0.0
             self.brain.net.adaptation[motor_nodes] = 0.0
 
-            # Reset eligibility — only this attempt's activity drives reward
             ne = self.brain.net._edge_count
             self.brain.net._edge_eligibility[:ne] = 0.0
 
-            self.brain.inject_signal(test_signal)
-            self.brain.step(n_steps=10, clamp_sensory=True)
+            # Free phase: guide gaze to test input, let network process
+            self._gaze_step(test_slot, n_steps=10,
+                            strength=gaze_strength, clamp_sensory=True)
             output_grid = self.brain.read_motor(out_h, out_w)
+
+            self.display_buffer.write_answer(output_grid)
+            if self.gaze_logger:
+                self.gaze_logger.record(
+                    self.brain.age, answer_slot, "answer", motor_event=True,
+                )
 
             rule_type = task.get("type", "")
             correct = verify_rule(rule_type, input_grid, output_grid,
@@ -377,42 +413,37 @@ class Teacher:
             n_cells = out_h * out_w
             cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
 
-            # Graded per-cell reward: correct cells reinforced, wrong cells
-            # weakened. Asymmetric magnitude (reward > punishment) prevents
-            # catastrophic unlearning. Rule-verified bonus on top.
-            cell_correct = (output_grid == expected_grid).flatten()
-            cell_rewards = np.where(cell_correct, 0.3, -0.1).astype(np.float64)
+            # Global DA based on overall accuracy
+            da = 0.1 + 0.3 * cell_acc
             if correct:
-                cell_rewards += 0.2
-            mean_change = self.brain.apply_cell_reward(cell_rewards)
-            self.brain.set_da(0.4 if correct else 0.15)
+                da += 0.1
+            self.brain.set_da(da)
 
             if correct:
                 break
 
-            # Capture free-phase correlations (what the network did wrong)
+            # Snapshot free-phase correlations (network's own attempt)
             last_free_corr = self.brain.snapshot_correlations(n_steps=15)
 
-            # Correction: show the correct answer (input + output clamped).
-            # CHL compares these clamped correlations against the free phase
-            # to compute error-driven weight updates during sleep replay.
-            correction_sensory = grid_to_signal(input_grid, max_h=h, max_w=w)
-            correction_motor = self._motor_signal_from_grid(expected_grid, h, w)
-            self.brain.inject_teaching_signal(correction_sensory, correction_motor)
+            # Clamped phase: show correct answer visually via gaze.
+            # Copy pathway sees the answer and drives motor naturally.
+            self.display_buffer.write_answer(expected_grid)
+            self._gaze_step(answer_slot, n_steps=20, strength=gaze_strength)
             clamped_corr = self.brain.snapshot_correlations(n_steps=15)
 
             mean_change = self.brain.apply_chl(last_free_corr, clamped_corr)
 
             self.brain.clear_signal()
+            self.brain.clear_gaze_bias()
             self.brain.step(n_steps=5)
 
-        # If solved on first try, still store correlations for sleep replay
         if correct and last_free_corr is None:
             free_corr = self.brain.snapshot_correlations(n_steps=15)
             self.brain.store_replay(free_corr, free_corr)
 
         # --- Phase 4: Rest + spontaneous replay ---
         self.brain.clear_signal()
+        self.brain.clear_gaze_bias()
         self.brain.step(n_steps=10)
         self.brain.spontaneous_replay(n_steps=10, strength=0.2)
 
@@ -420,7 +451,7 @@ class Teacher:
         if sleep_stats:
             self.monitor.sleep_event(sleep_stats, self.brain.age)
 
-        # Update tracking (based on final attempt result)
+        # Update tracking
         tracker = self.state.type_trackers.setdefault(task_type, TypeTracker())
         tracker.attempts += 1
         tracker.last_tested_age = self.brain.age

@@ -257,6 +257,14 @@ def _spmv_csr_parallel(indptr, indices, data, buf, syn, n_nodes):
 
 
 @numba.jit(nopython=True, parallel=True, cache=True)
+def _update_r_trace(r_trace, r, trace_decay, n_nodes):
+    """Update slow activity trace: EMA of firing rates."""
+    alpha = 1.0 - trace_decay
+    for i in numba.prange(n_nodes):
+        r_trace[i] = r_trace[i] * trace_decay + r[i] * alpha
+
+
+@numba.jit(nopython=True, parallel=True, cache=True)
 def _eligibility_update_parallel(
     edge_elig, edge_src, edge_dst, r, edge_plastic, n_edges, elig_decay,
 ):
@@ -278,8 +286,18 @@ def _plasticity_update_parallel(
     edge_w, edge_src, edge_dst, r_pre_wta, edge_plastic, n_edges,
     node_col_id, col_mean_r, ema_rate_dendritic,
     eta_local, eta, DA, w_max,
+    r_trace, edge_is_l1_to_l2, use_trace_rule, trace_contrast_eta,
 ):
-    """Parallel Krotov-Hopfield competitive Hebbian — each edge is independent."""
+    """Parallel Krotov-Hopfield competitive Hebbian — each edge is independent.
+
+    For L1->L2 edges when use_trace_rule is True, the post-synaptic term
+    uses r_trace (slow EMA) instead of instantaneous r_pre_wta. This binds
+    temporally adjacent representations across saccades (DiCarlo & Cox 2007).
+
+    Includes a heterosynaptic LTD term for L1->L2: when an L2 neuron was
+    recently active (high trace) but is NOT active now, weaken the connection
+    from any active L1 input. This improves discrimination across patterns.
+    """
     _EPS = 1e-6
     for e in numba.prange(n_edges):
         if not edge_plastic[e]:
@@ -288,6 +306,14 @@ def _plasticity_update_parallel(
         post_pre_wta = r_pre_wta[edge_dst[e]]
         if pre_r < 0.001 and post_pre_wta < 0.001:
             continue
+
+        is_l1_l2_trace = use_trace_rule and edge_is_l1_to_l2[e]
+
+        # For L1->L2 edges: use the slow trace as the post-synaptic signal.
+        if is_l1_l2_trace:
+            post_for_plasticity = r_trace[edge_dst[e]]
+        else:
+            post_for_plasticity = post_pre_wta
 
         col_id = node_col_id[edge_dst[e]]
         if col_id < 0:
@@ -300,13 +326,13 @@ def _plasticity_update_parallel(
         if conscience > 0.0:
             h_star += conscience
 
-        delta = post_pre_wta - h_star
+        delta = post_for_plasticity - h_star
         if delta > 0.0:
             g_h = delta * delta
         else:
             g_h = 0.0
 
-        if g_h < 1e-8:
+        if g_h < 1e-8 and not is_l1_l2_trace:
             continue
 
         w_old = edge_w[e]
@@ -314,6 +340,13 @@ def _plasticity_update_parallel(
 
         dw = eta_local * g_h * (pre_r - w_abs)
         dw += eta * DA * g_h * pre_r
+
+        # Heterosynaptic LTD for L1->L2: L2 was recently active (trace)
+        # but isn't now, while L1 IS active — weaken the connection.
+        if is_l1_l2_trace:
+            trace_val = r_trace[edge_dst[e]]
+            if trace_val > 0.01 and post_pre_wta < 0.01 and pre_r > 0.01:
+                dw -= trace_contrast_eta * eta_local * trace_val * pre_r
 
         if w_old < 0.0:
             dw = -dw
@@ -421,6 +454,9 @@ def run_steps_plastic(
     col_mean_r,
     ema_rate_dendritic,
     csr_indptr=None, csr_indices=None, csr_data=None,
+    r_trace=None, trace_decay=0.95,
+    edge_is_l1_to_l2=None, use_trace_rule=False,
+    trace_contrast_eta=0.3,
 ):
     """
     Dynamics with competitive Hebbian plasticity + eligibility traces.
@@ -471,15 +507,22 @@ def run_steps_plastic(
         wta_pool(r, mem_pool_indices, mem_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
+        if r_trace is not None:
+            _update_r_trace(r_trace, r, trace_decay, n_nodes)
+
         _eligibility_update_parallel(
             edge_elig, edge_src, edge_dst, r, edge_plastic, n_edges, elig_decay,
         )
 
         if plasticity_interval > 0 and s > 0 and s % plasticity_interval == 0:
+            _trace_rule = use_trace_rule and r_trace is not None and edge_is_l1_to_l2 is not None
+            _r_tr = r_trace if r_trace is not None else r_pre_wta
+            _l1l2 = edge_is_l1_to_l2 if edge_is_l1_to_l2 is not None else edge_plastic
             _plasticity_update_parallel(
                 edge_w, edge_src, edge_dst, r_pre_wta, edge_plastic, n_edges,
                 node_col_id, col_mean_r, ema_rate_dendritic,
                 eta_local, eta, DA, w_max,
+                _r_tr, _l1l2, _trace_rule, trace_contrast_eta,
             )
 
 

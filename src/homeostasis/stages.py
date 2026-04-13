@@ -43,12 +43,13 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         wta_active_frac=0.3,            # starts broad (PV+ immature), ramped to 0.1 by run_infancy
         noise_std=0.05,                 # spontaneous activity: enough to fire, not enough to drown signal
         task_mix_ratio=0.0,             # pure unsupervised stimuli
+        babble_ratio=0.15,              # motor babble from birth — discover action-to-canvas contingency
         copy_strength=1.0,              # full instinct — copy pathway at birth weight
-        # Layer-aware: protect higher layers — they barely exist yet
+        # Layer-aware: protect higher layers during initial wiring
         health_decay_L2_scale=0.3,      # L2 almost immune to pruning
-        health_decay_L3_scale=0.1,      # L3 fully protected (PFC barely wired)
+        health_decay_L3_scale=0.05,     # L3/KC fully protected — random wiring must establish
         synaptogenesis_L2_boost=1.0,
-        synaptogenesis_L3_boost=1.0,
+        synaptogenesis_L3_boost=3.0,    # mushroom body needs dense random wiring from birth
     ),
     "late_infancy": HomeostasisSetpoints(
         # Motor babbling and mimicry phase.  L1 is stable; the baby can
@@ -76,11 +77,11 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         task_mix_ratio=0.0,             # no formal tasks yet
         babble_ratio=0.4,               # 40% motor activities — L1 still needs its normal sensory diet
         copy_strength=1.0,              # full strength — it IS the desire to imitate
-        # Layer-aware: L2/L3 starting to wire up via babbling co-activity
+        # Layer-aware: L3/KC wiring largely set; input plasticity freezes this stage
         health_decay_L2_scale=0.5,
-        health_decay_L3_scale=0.2,
+        health_decay_L3_scale=0.3,      # gentle pruning — KC wiring stabilizing
         synaptogenesis_L2_boost=1.5,    # motor babbling creates L2 demand
-        synaptogenesis_L3_boost=2.0,    # L3 needs a head start
+        synaptogenesis_L3_boost=1.0,    # KC wiring mostly done, maintenance only
     ),
     "childhood": HomeostasisSetpoints(
         # Identity should already work from mimicry training.
@@ -106,11 +107,11 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         task_mix_ratio=0.7,             # mostly supervised tasks, 30% stimuli continues
         babble_ratio=0.1,               # some continued mimicry alongside tasks
         copy_strength=0.1,              # near-gone — learned pathways must carry motor output now
-        # Layer-aware: L2/L3 actively growing, still partially protected
+        # Layer-aware: L3/KC inputs frozen, learning on L3->MOTOR (KC->MBON)
         health_decay_L2_scale=0.7,
-        health_decay_L3_scale=0.4,
+        health_decay_L3_scale=0.5,      # prune unused KC->MBON connections
         synaptogenesis_L2_boost=2.0,    # cross-layer wiring demand
-        synaptogenesis_L3_boost=5.0,    # PFC peak growth — needs most help
+        synaptogenesis_L3_boost=1.0,    # KC wiring fixed — no new input edges needed
     ),
     "adolescence": HomeostasisSetpoints(
         # Homeostatic (sleep-only application)
@@ -134,11 +135,11 @@ STAGES: dict[str, HomeostasisSetpoints] = {
         noise_std=0.02,                 # low spontaneous activity (adult cortex)
         task_mix_ratio=1.0,             # fully supervised
         copy_strength=0.0,              # extinct — reflex fully replaced by cortical motor pathways
-        # Layer-aware: approaching adult — L3/PFC still last to fully mature
+        # Layer-aware: adult — KC wiring long frozen, KC->MBON learning continues
         health_decay_L2_scale=1.0,
-        health_decay_L3_scale=0.8,      # PFC matures last (Petanjek 2011)
+        health_decay_L3_scale=1.0,      # full adult pruning
         synaptogenesis_L2_boost=1.0,
-        synaptogenesis_L3_boost=1.0,
+        synaptogenesis_L3_boost=0.5,    # minimal — KC circuit is mature
     ),
 }
 

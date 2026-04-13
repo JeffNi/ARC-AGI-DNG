@@ -41,6 +41,8 @@ class Region(enum.Enum):
     LOCAL_DETECT = "local_detect"
     MID_LEVEL = "mid_level"
     ABSTRACT = "abstract"
+    GATE = "gate"
+    GAZE = "gaze"
 
 
 # Cortical hierarchy layers (ordered low → high)
@@ -138,6 +140,8 @@ class DNG:
     input_nodes: np.ndarray = None
     output_nodes: np.ndarray = None
     memory_nodes: np.ndarray = None
+    gate_nodes: np.ndarray = None
+    gaze_nodes: np.ndarray = None
 
     # Edge storage
     _edge_src: np.ndarray = field(default=None, repr=False)
@@ -161,6 +165,9 @@ class DNG:
     column_ids: np.ndarray = field(default=None, repr=False)
     n_columns: int = field(default=0, repr=False)
     wta_k_frac: float = field(default=0.2, repr=False)
+
+    # Slow activity trace for temporal contiguity learning (trace rule)
+    r_trace: np.ndarray = field(default=None, repr=False)
 
     # Type masks
     _mask_I: np.ndarray = field(default=None, repr=False)
@@ -192,6 +199,13 @@ class DNG:
             self.column_ids = np.full(n, -1, dtype=np.int32)
         if self.memory_nodes is None:
             self.memory_nodes = np.array([], dtype=np.int32)
+        if self.gate_nodes is None:
+            self.gate_nodes = np.array([], dtype=np.int32)
+        if self.gaze_nodes is None:
+            self.gaze_nodes = np.array([], dtype=np.int32)
+
+        if self.r_trace is None:
+            self.r_trace = np.zeros(n)
 
         if self._edge_src is None:
             cap = max(1000, n * 10)
@@ -357,6 +371,8 @@ class DNG:
             input_nodes=self.input_nodes,
             output_nodes=self.output_nodes,
             memory_nodes=self.memory_nodes,
+            gate_nodes=self.gate_nodes,
+            gaze_nodes=self.gaze_nodes,
             edges_src=self._edge_src[:n].copy(),
             edges_dst=self._edge_dst[:n].copy(),
             edges_w=self._edge_w[:n].copy(),
@@ -374,6 +390,7 @@ class DNG:
             ach=np.array([self.ach]),
             ne=np.array([self.ne]),
             inh_scale=np.array([self.inh_scale]),
+            r_trace=self.r_trace,
         )
 
     @classmethod
@@ -422,6 +439,10 @@ class DNG:
             net.f_max = float(data["f_max"][0])
         if "memory_nodes" in data:
             net.memory_nodes = data["memory_nodes"]
+        if "gate_nodes" in data:
+            net.gate_nodes = data["gate_nodes"]
+        if "gaze_nodes" in data:
+            net.gaze_nodes = data["gaze_nodes"]
         if "column_ids" in data:
             net.column_ids = data["column_ids"]
             net.n_columns = int(data["n_columns"][0])
@@ -436,6 +457,8 @@ class DNG:
             net.ne = float(data["ne"][0])
         if "inh_scale" in data:
             net.inh_scale = float(data["inh_scale"][0])
+        if "r_trace" in data:
+            net.r_trace = data["r_trace"].copy()
 
         net._edge_src = np.empty(cap, dtype=np.int32)
         net._edge_dst = np.empty(cap, dtype=np.int32)
