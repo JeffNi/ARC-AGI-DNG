@@ -74,9 +74,9 @@ The network successfully develops stable representations through infancy and lat
 - Discriminates confusable patterns that L1 cannot (L2 vs L1 improvement: +0.44 on confusable pairs)
 - Driven fraction ~0.42 at maturity
 
-**L3 (Mushroom Body) — Working as designed**
+**L3 (Mushroom Body) — Partially working**
 - Sparseness locked at exactly 10% for all 40 days (APL inhibition working)
-- Category separation (catSep) rose from 0.13 at birth to ~0.60 — different inputs activate different sparse subsets
+- Cross-category similarity (catSim) at 0.60 — pattern separation needs improvement (lower = more distinct; random baseline ~0.13). Cause identified: Hebbian plasticity during infancy eroded the random L2→L3 wiring. Next fix: freeze L3 input edges from birth.
 - 150+ unique active neurons per probe
 
 **Gaze System — Developing**

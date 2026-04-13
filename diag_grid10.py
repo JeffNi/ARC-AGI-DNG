@@ -251,9 +251,9 @@ def l2_l3_diagnostic(brain, h, w):
     trans_tol_l2 = float(np.mean(l2_trans_sims))
     trans_tol = trans_tol_l2 - trans_tol_l1
 
-    # --- Cross-category separation ---
-    # Similarity between structurally different stimuli at L2.
-    # Lower = better separation.
+    # --- Cross-category similarity ---
+    # Mean cosine similarity between structurally different stimuli at L2.
+    # Lower = better separation (more distinct representations).
     base_l1s, base_l2s, base_l3s = [], [], []
     l2_active_sets: list[set[int]] = []
     l3_active_sets: list[set[int]] = []
@@ -269,7 +269,7 @@ def l2_l3_diagnostic(brain, h, w):
     for i in range(len(bases)):
         for j in range(i + 1, len(bases)):
             cross_sims.append(cosine(base_l2s[i], base_l2s[j]))
-    cat_sep = float(np.mean(cross_sims)) if cross_sims else 0.0
+    cat_sim = float(np.mean(cross_sims)) if cross_sims else 0.0
 
     # --- Driven activity ---
     # Fraction of neurons that fire (r > 0.01) for at least one stimulus
@@ -313,12 +313,12 @@ def l2_l3_diagnostic(brain, h, w):
             l3_jaccards.append(inter / union if union > 0 else 1.0)
     l3_jacc = float(np.mean(l3_jaccards)) if l3_jaccards else 1.0
 
-    # L3 cross-category separation (cosine between different stimuli)
+    # L3 cross-category similarity (cosine between different stimuli — lower = better)
     l3_cross_sims = []
     for i in range(len(bases)):
         for j in range(i + 1, len(bases)):
             l3_cross_sims.append(cosine(base_l3s[i], base_l3s[j]))
-    l3_cat_sep = float(np.mean(l3_cross_sims)) if l3_cross_sims else 0.0
+    l3_cat_sim = float(np.mean(l3_cross_sims)) if l3_cross_sims else 0.0
 
     restore()
 
@@ -326,7 +326,7 @@ def l2_l3_diagnostic(brain, h, w):
         "l2_trans_tol": trans_tol,
         "l2_trans_l1": trans_tol_l1,
         "l2_trans_l2": trans_tol_l2,
-        "l2_cat_sep": cat_sep,
+        "l2_cat_sim": cat_sim,
         "l2_driven_frac": l2_driven_frac,
         "l2_uniq": l2_uniq,
         "l2_jacc": l2_jacc,
@@ -336,7 +336,7 @@ def l2_l3_diagnostic(brain, h, w):
         "l3_n_active": l3_n_active,
         "l3_sparseness": l3_sparseness,
         "l3_jacc": l3_jacc,
-        "l3_cat_sep": l3_cat_sep,
+        "l3_cat_sim": l3_cat_sim,
     }
 
 
@@ -373,12 +373,12 @@ def measure(brain, h, w, label):
           f"nAct={m_l1['n_active']:.0f}")
     print(f"    L2: driven={m_hl['l2_driven_frac']:.3f}  "
           f"transTol={m_hl['l2_trans_tol']:+.3f}  "
-          f"catSep={m_hl['l2_cat_sep']:.3f}  "
+          f"catSim={m_hl['l2_cat_sim']:.3f}  "
           f"uniq={m_hl['l2_uniq']}  jacc={m_hl['l2_jacc']:.3f}  "
           f"nAct={m_hl['l2_n_active']:.0f}")
     print(f"    L3: driven={m_hl['l3_driven_frac']:.3f}  "
           f"sparse={m_hl['l3_sparseness']:.3f}  "
-          f"catSep={m_hl['l3_cat_sep']:.3f}  "
+          f"catSim={m_hl['l3_cat_sim']:.3f}  "
           f"uniq={m_hl['l3_uniq']}  jacc={m_hl['l3_jacc']:.3f}  "
           f"nAct={m_hl['l3_n_active']:.0f}")
 

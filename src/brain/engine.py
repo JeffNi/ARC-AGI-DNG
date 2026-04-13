@@ -459,13 +459,16 @@ class Brain:
         sp = self.stage_manager.current_setpoints()
 
         # Mushroom body: freeze PN->KC (input to L3) plasticity after infancy.
-        # The sparse random wiring IS the representation — learning happens
-        # at KC->MBON (L3->MOTOR) via DA-gated eligibility traces.
-        if learn and self.stage_manager.current_stage not in ("infancy",):
+        # Mushroom body (L3/KC) input edges are NEVER plastic.
+        # The sparse random wiring IS the representation — pattern separation
+        # comes from the randomness of connectivity, not from learning.
+        # Learning happens at KC->MBON (L3->MOTOR) via DA-gated eligibility.
+        if learn:
             into_l3 = self._get_edge_into_l3(ne)
-            if edge_plastic is self._edge_plastic_cache:
-                edge_plastic = edge_plastic.copy()
-            edge_plastic[into_l3] = False
+            if into_l3.any():
+                if edge_plastic is self._edge_plastic_cache:
+                    edge_plastic = edge_plastic.copy()
+                edge_plastic[into_l3] = False
         self.homeostasis.setpoints = sp
 
         # L1 critical period depends on stage — invalidate during transitions
