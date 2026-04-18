@@ -1,23 +1,22 @@
 """
 Template generator: genome -> DNG.
 
-Hierarchical cortical layout:
-  SENSORY (perception features: 30 per cell + 28 global)
-    -> LAYER 1 / LOCAL_DETECT (sparse RF, local feature combination)
-      -> LAYER 2 / MID_LEVEL (wider RF, regional integration)
-        -> LAYER 3 / ABSTRACT (non-topographic, reasoning)
-          -> MOTOR (10 colors per cell, one-hot)
-          <-> MEMORY (self-sustaining, episodic)
+Autonomous mushroom body architecture:
+  SENSORY (one-hot color: 10 per cell)
+    -> L3 / Kenyon Cells (sparse random expansion, ~10 inputs each)
+      -> POSITION (9 neurons, WTA)  — which cell to target
+      -> DONE (1 neuron)            — submit signal
+      -> MEMORY (10 groups of 10, one per color — MBON compartments)
+  MEMORY group k -> ACTION(k)  [fixed strong wiring]
+  L3 -> MEMORY               [PLASTIC, depression-based learning site]
 
-Information flows bottom-up through the hierarchy. Feedback connections
-(top-down) exist but are weak at birth. Lateral connections within each
-layer enable local competition. Only Layer 3 connects to Motor (learned
-output path). The instinct copy pathway bypasses the hierarchy entirely.
+Learning: DA-modulated synaptic depression at KC→MBON (L3→MEMORY).
+Wrong color commit → depress L3→MEMORY for wrong color's group.
+Correct color emerges by elimination (undepressed groups remain strong).
 
-Instinct circuits:
-  - Copy pathway: sensory color nodes -> motor color nodes (identity mapping)
-  - Memory self-connections: bistable attractor dynamics
-  - Memory <-> Layer 3: write and recall paths
+Instinct circuits (hardwired, NOT plastic):
+  - Spatial instinct: SENSORY(cell_i) -> POSITION(cell_i)
+  - Color echo instinct: position-gated at runtime (tie-breaker for naive brain)
 """
 
 from __future__ import annotations
@@ -25,9 +24,16 @@ from __future__ import annotations
 import numpy as np
 
 from .encoding import NUM_COLORS
-from .perception.encoder import sensory_size, FEATURES_PER_CELL, GLOBAL_FEATURES
+from .perception.encoder import sensory_size, FEATURES_PER_CELL
 from .genome import Genome
 from .graph import DNG, NodeType, Region, DEFAULT_LEAK, _NTYPE_E, _NTYPE_I
+
+
+N_POSITION = 9   # one per grid cell (3x3)
+N_ACTION = 11     # 10 colors + 1 no-op
+N_DONE = 1
+N_COMMIT = 1      # basal ganglia go/no-go gate for commits
+N_MOTOR_NEW = N_POSITION + N_ACTION + N_DONE + N_COMMIT
 
 
 def create_dng(
@@ -41,18 +47,22 @@ def create_dng(
 
     n_cells = grid_h * grid_w
     n_sensory = sensory_size(grid_h, grid_w)
-    n_motor = n_cells * NUM_COLORS
     n_int = genome.n_internal
     n_mem = genome.n_memory
     n_gate = genome.n_gate
     n_gaze = genome.n_gaze
 
-    # Split internal into 3 cortical layers
     n_l1 = int(n_int * genome.frac_layer1)
     n_l2 = int(n_int * genome.frac_layer2)
     n_l3 = n_int - n_l1 - n_l2
 
-    n_total = n_sensory + n_int + n_mem + n_gate + n_gaze + n_motor
+    n_position = n_cells  # one POSITION neuron per grid cell
+    n_action = NUM_COLORS + 1  # 10 colors + 1 no-op
+    n_done = 1
+    n_commit = 1  # basal ganglia go/no-go gate
+    n_motor_total = n_position + n_action + n_done + n_commit
+
+    n_total = n_sensory + n_int + n_mem + n_gate + n_gaze + n_motor_total
 
     sensory_start = 0
     l1_start = n_sensory
@@ -61,67 +71,70 @@ def create_dng(
     memory_start = n_sensory + n_int
     gate_start = n_sensory + n_int + n_mem
     gaze_start = n_sensory + n_int + n_mem + n_gate
-    motor_start = n_sensory + n_int + n_mem + n_gate + n_gaze
+    position_start = n_sensory + n_int + n_mem + n_gate + n_gaze
+    action_start = position_start + n_position
+    done_start = action_start + n_action
+    commit_start = done_start + n_done
 
     sensory = np.arange(sensory_start, sensory_start + n_sensory)
     layer1 = np.arange(l1_start, l1_start + n_l1)
     layer2 = np.arange(l2_start, l2_start + n_l2)
     layer3 = np.arange(l3_start, l3_start + n_l3)
-    all_internal = np.arange(l1_start, l1_start + n_int)
     memory = np.arange(memory_start, memory_start + n_mem)
     gate = np.arange(gate_start, gate_start + n_gate)
     gaze = np.arange(gaze_start, gaze_start + n_gaze)
-    motor = np.arange(motor_start, motor_start + n_motor)
+    position = np.arange(position_start, position_start + n_position)
+    action = np.arange(action_start, action_start + n_action)
+    done = np.arange(done_start, done_start + n_done)
+    commit = np.arange(commit_start, commit_start + n_commit)
+    motor_all = np.concatenate([position, action, done, commit])
 
-    # Node types: E/I split for all internal layers
+    # Node types: all excitatory
     node_types = np.full(n_total, _NTYPE_E, dtype=int)
-    n_inhib = int(n_int * genome.frac_inhibitory)
-    n_exc = n_int - n_inhib
-    internal_types = [_NTYPE_E] * n_exc + [_NTYPE_I] * n_inhib
-    rng.shuffle(internal_types)
-    node_types[l1_start:l1_start + n_int] = internal_types
-    node_types[gate] = _NTYPE_I  # gate neurons are all inhibitory (BG indirect pathway)
-    node_types[gaze] = _NTYPE_E  # gaze neurons are excitatory (oculomotor WTA)
 
-    # Regions — assign each layer its own region
+    # Regions
     _reg = list(Region)
     regions = np.zeros(n_total, dtype=int)
     regions[sensory] = _reg.index(Region.SENSORY)
-    regions[layer1] = _reg.index(Region.LOCAL_DETECT)
-    regions[layer2] = _reg.index(Region.MID_LEVEL)
+    if len(layer1) > 0:
+        regions[layer1] = _reg.index(Region.LOCAL_DETECT)
+    if len(layer2) > 0:
+        regions[layer2] = _reg.index(Region.MID_LEVEL)
     regions[layer3] = _reg.index(Region.ABSTRACT)
-    regions[memory] = _reg.index(Region.MEMORY)
-    regions[gate] = _reg.index(Region.GATE)
-    regions[gaze] = _reg.index(Region.GAZE)
-    regions[motor] = _reg.index(Region.MOTOR)
+    if len(memory) > 0:
+        regions[memory] = _reg.index(Region.MEMORY)
+    if len(gate) > 0:
+        regions[gate] = _reg.index(Region.GATE)
+    if len(gaze) > 0:
+        regions[gaze] = _reg.index(Region.GAZE)
+    regions[position] = _reg.index(Region.POSITION)
+    regions[action] = _reg.index(Region.ACTION)
+    regions[done] = _reg.index(Region.DONE)
+    regions[commit] = _reg.index(Region.COMMIT)
 
-    # Leak rates per node type
+    # Leak rates (from genome)
     _ntype_list = list(NodeType)
     leak_rates = np.array([DEFAULT_LEAK[_ntype_list[t]] for t in node_types])
-    leak_rates[memory] = 0.02
+    leak_rates[layer3] = genome.leak_l3
+    if len(memory) > 0:
+        leak_rates[memory] = genome.leak_memory
+    leak_rates[motor_all] = genome.leak_motor
 
-    # Per-node parameters
     max_rate = np.full(n_total, genome.max_rate_E)
+    # Sensory neurons are input transducers — output proportional to signal.
+    max_rate[sensory] = 20.0
+    # L3/KCs need rate headroom so weight variance creates distinguishable
+    # activation levels for the APL WTA.  Capping at 1.0 flattens all KCs
+    # to the same rate and the WTA zeros everyone.
+    max_rate[layer3] = 10.0
     adapt_rate = np.full(n_total, genome.adapt_rate_E)
-    i_mask = node_types == _NTYPE_I
-    max_rate[i_mask] = genome.max_rate_I
-    adapt_rate[i_mask] = genome.adapt_rate_I
+    adapt_rate[sensory] = 0.0  # no adaptation for input transducers
 
-    # Column assignments: each layer gets SEPARATE columns so WTA
-    # competition is within-layer (V1 neurons compete with V1, not V4).
-    # L1 columns: 0..n_cells-1, L2 columns: n_cells..2*n_cells-1.
-    # L3: column_id = -1 (non-topographic, competes in global pool).
+    # Column IDs: sensory cells get column assignments for diagnostics
     column_ids = np.full(n_total, -1, dtype=np.int32)
-    column_ids[l1_start:l1_start + n_l1] = np.arange(n_l1) % n_cells
-    column_ids[l2_start:l2_start + n_l2] = n_cells + (np.arange(n_l2) % n_cells)
-    # Sensory neurons
     for cell in range(n_cells):
         s0 = sensory_start + cell * FEATURES_PER_CELL
         column_ids[s0:s0 + FEATURES_PER_CELL] = cell
-    # Motor neurons
-    for cell in range(n_cells):
-        m0 = motor_start + cell * NUM_COLORS
-        column_ids[m0:m0 + NUM_COLORS] = cell
 
     net = DNG(
         n_nodes=n_total,
@@ -132,7 +145,7 @@ def create_dng(
         max_rate=max_rate,
         adapt_rate=adapt_rate,
         input_nodes=sensory,
-        output_nodes=motor,
+        output_nodes=motor_all,
         memory_nodes=memory,
         gate_nodes=gate,
         gaze_nodes=gaze,
@@ -145,398 +158,183 @@ def create_dng(
         f_max=genome.f_max,
     )
 
+    if len(memory) > 0:
+        net.threshold[memory] = genome.threshold_memory
+
+    if len(commit) > 0:
+        net.threshold[commit] = genome.threshold_commit
+        net.excitability[commit] = genome.excitability_commit
+        net.leak_rates[commit] = genome.leak_commit
+
     ws = genome.weight_scale
-    cap = genome.max_fan_in
 
     # ═══════════════════════════════════════════════════════════════════
-    # FEEDFORWARD PATHWAY (strong at birth)
+    # SENSORY -> L3/KC: cell-local sparse projection (mushroom body wiring)
+    #
+    # Biology: each KC's dendritic claw samples from a LOCAL neighborhood
+    # in the calyx.  We partition KCs into cell-assigned groups. Each KC
+    # draws most inputs from its assigned cell, with a few from elsewhere.
+    # This creates the activation variance the APL WTA needs.
     # ═══════════════════════════════════════════════════════════════════
-
-    # SENSORY -> LAYER 1: sparse receptive fields (dendritic sampling)
-    rf_prob = 0.05
-    _local_rf_edges(
-        net, sensory_start, layer1, grid_h, grid_w, n_cells,
-        rf_radius=2, long_range_frac=0.15, ws=ws / rf_prob**0.5, rng=rng,
-        direction='sensory_to_internal',
-        n_sensory=n_sensory,
-        connection_prob=rf_prob,
+    _wire_kc_local(
+        net, sensory, layer3, n_cells,
+        local_fan=genome.kc_local_fan,
+        global_fan=genome.kc_global_fan,
+        weight_scale=ws * genome.w_scale_sensory_to_l3,
+        rng=rng,
     )
 
-    # LAYER 1 -> LAYER 2: wider effective RF, each L2 neuron samples
-    # from L1 neurons across multiple columns (~radius 3).
-    # Corticocortical feedforward synapses are individually stronger
-    # than thalamocortical ones because they carry post-WTA sparse
-    # signals that need amplification at each stage.
-    ff_ws = ws * 8.0
-    _inter_layer_rf_edges(
-        net, layer1, layer2, grid_h, grid_w, n_cells,
-        rf_radius=3, connection_prob=0.15,
-        ws=ff_ws, rng=rng,
-    )
-
-    # L3 = Mushroom body / Kenyon cells. Expansion recoding layer.
-    # Each KC samples a SPARSE random subset of inputs, creating unique
-    # conjunction detectors. Pattern separation comes from the randomness
-    # and sparseness of this wiring, not from learning.
-    # Bee: ~7 PN inputs per KC out of ~800 PNs. We use ~15 per KC.
-    # Weight scale is lower so individual inputs are subthreshold —
-    # KCs require coincident activation of multiple inputs to fire.
-    # Conjunction selectivity comes from SPARSE connectivity (few inputs per KC),
-    # not from reduced weight scale. Use full ff_ws so KCs can actually fire
-    # when their sparse input set is active.
-
-    # SENSORY -> L3/KC: very sparse direct sampling
-    fan_s_l3 = _fan_in(0.005, n_sensory, cap)
-    _fan_in_edges(net, sensory, layer3, fan_s_l3, ws * 2.0, rng)
-
-    # L1 -> L3/KC: sparse random skip (each KC samples ~13 L1 neurons)
-    fan_l1_l3 = _fan_in(0.03, n_l1, cap)
-    _fan_in_edges(net, layer1, layer3, fan_l1_l3, ff_ws, rng)
-
-    # L2 -> L3/KC: sparse random projection (each KC samples ~15 L2 neurons)
-    fan_l2_l3 = _fan_in(0.05, n_l2, cap)
-    _fan_in_edges(net, layer2, layer3, fan_l2_l3, ff_ws, rng)
-
-    # LAYER 3 -> MOTOR: learned output pathway
-    _local_rf_edges(
-        net, motor_start, layer3, grid_h, grid_w, n_cells,
-        rf_radius=2, long_range_frac=0.35, ws=ws * 0.1 / rf_prob**0.5, rng=rng,
-        direction='internal_to_motor',
-        n_sensory=n_sensory,
-        connection_prob=rf_prob,
-    )
-
-    # L1 -> MOTOR: topographic output from local features.
-    # In cortex, primary sensory areas can drive motor output directly
-    # (e.g. V1->superior colliculus for saccades). Starts as silent
-    # synapses — CHL teaches the correct mapping during childhood.
-    _inter_layer_rf_edges(
-        net, layer1, motor, grid_h, grid_w, n_cells,
-        rf_radius=2, connection_prob=0.10,
-        ws=ws * 0.1, rng=rng,
-    )
-
-    # L2 -> MOTOR: topographic output from mid-level features.
-    # Wider RF since L2 encodes broader spatial patterns.
-    _inter_layer_rf_edges(
-        net, layer2, motor, grid_h, grid_w, n_cells,
-        rf_radius=3, connection_prob=0.10,
-        ws=ws * 0.1, rng=rng,
-    )
+    # Store KC cell assignments so engine can apply position-specific gain
+    kc_cell_ids = np.full(n_l3, -1, dtype=np.int32)
+    n_kc_per_cell = n_l3 // n_cells
+    _remainder = n_l3 % n_cells
+    _ki = 0
+    for _c in range(n_cells):
+        _nk = n_kc_per_cell + (1 if _c < _remainder else 0)
+        kc_cell_ids[_ki : _ki + _nk] = _c
+        _ki += _nk
+    net._kc_cell_ids = kc_cell_ids
 
     # ═══════════════════════════════════════════════════════════════════
-    # FEEDBACK PATHWAY (weak at birth, ~10% of feedforward)
+    # L3/KC -> POSITION: learned pathway (KC -> MBON analog for spatial)
     # ═══════════════════════════════════════════════════════════════════
-    feedback_ws = ws * 0.1
+    kc_pos_fan = max(1, min(int(0.15 * n_l3), n_l3, genome.max_fan_in))
+    _fan_in_edges(net, layer3, position, kc_pos_fan, ws * genome.w_scale_l3_to_position, rng)
 
-    # LAYER 2 -> LAYER 1
-    fan_l2_l1 = _fan_in(0.05, n_l2, cap)
-    _fan_in_edges(net, layer2, layer1, fan_l2_l1, feedback_ws, rng)
-
-    # LAYER 3 -> LAYER 2
-    fan_l3_l2 = _fan_in(0.05, n_l3, cap)
-    _fan_in_edges(net, layer3, layer2, fan_l3_l2, feedback_ws, rng)
+    # (L3/KC -> ACTION removed: KCs don't project to motor in biology.
+    #  Color selection is handled by the position-gated echo instinct.
+    #  Learning happens at KC->MBON (L3->MEMORY), not KC->motor.)
 
     # ═══════════════════════════════════════════════════════════════════
-    # LATERAL CONNECTIONS (within each layer, weak at birth)
+    # L3/KC -> DONE: learned pathway
     # ═══════════════════════════════════════════════════════════════════
-    lateral_ws = ws * 0.1
-
-    fan_l1_l1 = _fan_in(genome.density_internal_to_internal, n_l1, cap)
-    _fan_in_edges(net, layer1, layer1, fan_l1_l1, lateral_ws, rng)
-
-    fan_l2_l2 = _fan_in(genome.density_internal_to_internal, n_l2, cap)
-    _fan_in_edges(net, layer2, layer2, fan_l2_l2, lateral_ws, rng)
-
-    fan_l3_l3 = _fan_in(genome.density_internal_to_internal, n_l3, cap)
-    _fan_in_edges(net, layer3, layer3, fan_l3_l3, lateral_ws, rng)
+    kc_done_fan = max(1, min(int(0.10 * n_l3), n_l3, genome.max_fan_in))
+    _fan_in_edges(net, layer3, done, kc_done_fan, ws * genome.w_scale_l3_to_done, rng)
 
     # ═══════════════════════════════════════════════════════════════════
-    # OTHER PATHWAYS
+    # MEMORY group assignments: 10 groups of 10, one per color.
+    # Group k drives ACTION(k). This is the MBON compartment structure.
     # ═══════════════════════════════════════════════════════════════════
+    n_groups = min(NUM_COLORS, n_mem)
+    group_size = n_mem // n_groups if n_groups > 0 else 0
+    memory_group_ids = np.full(n_mem, -1, dtype=np.int32)
+    for g in range(n_groups):
+        g_start = g * group_size
+        g_end = g_start + group_size
+        memory_group_ids[g_start:g_end] = g
+    # Leftover neurons (if n_mem not divisible) go to last group
+    if n_mem > n_groups * group_size:
+        memory_group_ids[n_groups * group_size:] = n_groups - 1
 
-    # MOTOR -> LAYER 3: feedback from motor (proprioceptive-like)
-    fan_m2l3 = _fan_in(genome.density_motor_to_internal, n_motor, cap)
-    _fan_in_edges(net, motor, layer3, fan_m2l3, lateral_ws, rng)
+    # Store on the DNG so engine can reference group assignments
+    net._memory_group_ids = memory_group_ids
+    net._memory_start = memory_start
+    net._n_memory_groups = n_groups
+    net._memory_group_size = group_size
 
-    # LAYER 1 -> SENSORY: top-down feedback (weak at birth)
-    fan_l1_s = _fan_in(genome.density_internal_to_sensory, n_l1, cap)
-    _fan_in_edges(net, layer1, sensory, fan_l1_s, lateral_ws, rng)
+    # ═══════════════════════════════════════════════════════════════════
+    # L3 -> MEMORY: PLASTIC, depression-based learning site (KC → MBON)
+    # Strong initial weights — depression weakens wrong-color groups.
+    # ~15 L3 inputs per MEMORY neuron.
+    # ═══════════════════════════════════════════════════════════════════
+    if n_mem > 0:
+        mem_fan_in = min(50, n_l3)
+        l3_mem_start = net._edge_count
+        _fan_in_edges(net, layer3, memory, mem_fan_in, ws * genome.w_scale_l3_to_memory, rng,
+                      uniform=True)
+        l3_mem_end = net._edge_count
+        # Store initial weights for spontaneous recovery during sleep
+        net._l3_mem_initial_w = net._edge_w[l3_mem_start:l3_mem_end].copy()
+        net._l3_mem_edge_slice = (l3_mem_start, l3_mem_end)
+        # NOT consolidated — these are the primary learning site
 
-    # SENSORY -> MOTOR: diffuse background path (NOT the copy pathway).
-    # Kept very weak so the copy pathway dominates instinctive motor output.
-    # These can strengthen through learning if needed.
-    fan_s2m = _fan_in(genome.density_sensory_to_motor, n_sensory, cap)
-    _fan_in_edges(net, sensory, motor, fan_s2m, ws * 0.1, rng)
+    # ═══════════════════════════════════════════════════════════════════
+    # MEMORY -> POSITION: learned plastic
+    # ═══════════════════════════════════════════════════════════════════
+    if n_mem > 0:
+        mem_pos_fan = max(1, min(int(0.20 * n_mem), n_mem))
+        _fan_in_edges(net, memory, position, mem_pos_fan, ws * genome.w_scale_memory_to_position, rng)
 
-    # MEMORY circuit — tightly coupled to L3 (mushroom body architecture).
-    # In biology, Kenyon cells and their output neurons form one functional
-    # unit. Memory and L3 share strong bidirectional connections at the
-    # same weight scale as memory self-connections.
-    mem_ws = ws * 5
-    mem_fan_in = min(max(10, n_mem // 2), cap)
-    _fan_in_edges(net, memory, memory, mem_fan_in, mem_ws, rng)
-    _fan_in_edges(net, layer3, memory, min(max(15, n_l3 // 2), cap), mem_ws, rng)
-    _fan_in_edges(net, memory, layer3, min(max(15, n_mem // 2), cap), mem_ws, rng)
-    _fan_in_edges(net, memory, motor, min(max(10, n_mem // 2), cap), ws * 0.2, rng)
-    _fan_in_edges(net, sensory, memory, min(max(10, n_sensory // 5), cap), ws * 2, rng)
+    # MEMORY→ACTION graph edges REMOVED: the analytical MBON readout in
+    # _motor_wta computes the same signal without graph-dynamics lag.
+    # Graph edges were double-counting and adding noise.
 
-    # GATE circuit — basal ganglia analog for motor program selection.
-    # Gate neurons receive cortical context (L2/L3) and project inhibitorily
-    # to motor neurons. When active, they suppress the copy pathway's motor
-    # output, allowing cortical pathways to drive motor instead.
-    # Starts quiet (L2/L3 undeveloped at birth), learns via eligibility + DA.
-    if n_gate > 0:
-        gate_fan = min(max(5, n_gate // 2), cap)
-        _fan_in_edges(net, layer2, gate, gate_fan, ws * 2.0, rng)
-        _fan_in_edges(net, layer3, gate, gate_fan, ws * 2.0, rng)
-        # Gate -> motor: sign handled by _fan_in_edges (gate neurons are
-        # all inhibitory, so weights flip to negative automatically).
-        gate_motor_fan = min(max(10, n_motor // 20), cap)
-        _fan_in_edges(net, gate, motor, gate_motor_fan, ws * 10.0, rng)
+    # ═══════════════════════════════════════════════════════════════════
+    # MEMORY -> DONE: learned plastic
+    # ═══════════════════════════════════════════════════════════════════
+    if n_mem > 0:
+        mem_done_fan = max(1, min(int(0.15 * n_mem), n_mem))
+        _fan_in_edges(net, memory, done, mem_done_fan, ws * genome.w_scale_memory_to_done, rng)
 
-    # GAZE circuit — oculomotor neurons for active vision.
-    # Each gaze neuron represents one display slot. WTA competition
-    # selects which slot the network currently observes. Driven by
-    # higher cortical areas (L2/L3) and memory, NOT by sensory input
-    # (avoids trivial fixation loops where seeing something locks gaze).
-    if n_gaze > 0:
-        gaze_fan = min(max(3, n_gaze), cap)
-        _fan_in_edges(net, layer2, gaze, gaze_fan, ws * 1.0, rng)
-        _fan_in_edges(net, layer3, gaze, gaze_fan, ws * 2.0, rng)
-        _fan_in_edges(net, memory, gaze, gaze_fan, ws * 1.5, rng)
+    # POSITION→ACTION graph edges REMOVED: random initial weights injected
+    # noise that competed with the echo. Action selection is now purely
+    # echo + MBON readout + WTA noise (all computed in _motor_wta).
 
-        # INSTINCT: Motor activity -> look at answer canvas.
-        # When grid-motor neurons fire (the network "drew" something),
-        # the answer-slot gaze neuron gets excited, biasing the next
-        # saccade toward the answer canvas. This is the sensorimotor
-        # contingency every infant has: act -> look at the result.
-        # Consolidated during infancy, decays as learned gaze takes over.
-        answer_gaze_idx = int(gaze[-1])
-        fan_motor_gaze = min(50, n_motor)
-        motor_sample = rng.choice(motor, fan_motor_gaze, replace=False)
-        instinct_edge_start = net._edge_count
-        motor_gaze_src = motor_sample.astype(np.int32)
-        motor_gaze_dst = np.full(fan_motor_gaze, answer_gaze_idx, dtype=np.int32)
-        motor_gaze_w = np.full(fan_motor_gaze, ws * 3.0)
-        net.add_edges_batch(motor_gaze_src, motor_gaze_dst, motor_gaze_w)
-        instinct_edge_end = net._edge_count
-        net._edge_consolidation[instinct_edge_start:instinct_edge_end] = 10.0
+    # ═══════════════════════════════════════════════════════════════════
+    # COMMIT neuron: basal ganglia go/no-go gate
+    # Receives context (L3, MEMORY) + motor plan (POSITION, ACTION) to
+    # learn WHEN to commit. Fires when evidence is sufficient.
+    # ═══════════════════════════════════════════════════════════════════
+    # L3 -> COMMIT (sensory context)
+    kc_commit_fan = max(1, min(int(0.10 * n_l3), n_l3, genome.max_fan_in))
+    _fan_in_edges(net, layer3, commit, kc_commit_fan, ws * genome.w_scale_l3_to_commit, rng)
+    if n_mem > 0:
+        mem_commit_fan = max(1, min(int(0.15 * n_mem), n_mem))
+        _fan_in_edges(net, memory, commit, mem_commit_fan, ws * genome.w_scale_memory_to_commit, rng)
+    pos_commit_w = _init_weights(rng, ws * genome.w_scale_memory_to_commit, n_position)
+    net.add_edges_batch(position, np.full(n_position, commit[0], dtype=np.int32),
+                        pos_commit_w)
+    act_commit_w = _init_weights(rng, ws * genome.w_scale_memory_to_commit, n_action)
+    net.add_edges_batch(action, np.full(n_action, commit[0], dtype=np.int32),
+                        act_commit_w)
 
-    # INSTINCT: Copy pathway — sensory COLOR nodes -> motor nodes (1:1)
-    # Brainstem reflex: strong, consolidated, re-pinned every step.
-    # Decays as copy_strength drops during development.
-    copy_src = []
-    copy_dst = []
+    # ═══════════════════════════════════════════════════════════════════
+    # INSTINCT: Spatial instinct — SENSORY(cell_i) -> POSITION(cell_i)
+    # Retinotopic map: all features of cell i drive POSITION neuron i.
+    # Hardwired, NOT plastic. Consolidated.
+    # ═══════════════════════════════════════════════════════════════════
+    spatial_src = []
+    spatial_dst = []
     for cell in range(n_cells):
-        for k in range(NUM_COLORS):
-            s_idx = sensory_start + cell * FEATURES_PER_CELL + k
-            m_idx = motor_start + cell * NUM_COLORS + k
-            copy_src.append(s_idx)
-            copy_dst.append(m_idx)
-    copy_src = np.array(copy_src, dtype=np.int32)
-    copy_dst = np.array(copy_dst, dtype=np.int32)
-    copy_w = np.full(len(copy_src), 5.0)
+        for feat in range(FEATURES_PER_CELL):
+            s_idx = sensory_start + cell * FEATURES_PER_CELL + feat
+            p_idx = position_start + cell
+            spatial_src.append(s_idx)
+            spatial_dst.append(p_idx)
+    spatial_src = np.array(spatial_src, dtype=np.int32)
+    spatial_dst = np.array(spatial_dst, dtype=np.int32)
+    spatial_w = np.full(len(spatial_src), genome.spatial_instinct_weight)
     edge_start = net._edge_count
-    net.add_edges_batch(copy_src, copy_dst, copy_w)
+    net.add_edges_batch(spatial_src, spatial_dst, spatial_w)
     edge_end = net._edge_count
     net._edge_consolidation[edge_start:edge_end] = 20.0
 
-    # LEARNABLE COPY: same 1:1 color topology, weak initial weights.
-    # Cortical motor pathway: starts silent, strengthened by mimicry
-    # reward during late infancy. Takes over from the instinct pathway
-    # as copy_strength decays in childhood.
-    learn_w = np.full(len(copy_src), ws * 0.5)
-    net.add_edges_batch(copy_src, copy_dst, learn_w)
+    # Color echo instinct is now position-gated at runtime in engine._motor_wta().
+    # No static SENSORY->ACTION echo edges needed.
 
-    # Spatial neighbor connections for motor
-    _spatial_neighbors(net, motor_start, grid_h, grid_w,
-                       genome.density_motor_neighbors, ws, rng)
+    # ═══════════════════════════════════════════════════════════════════
+    # SENSORY -> GAZE: orienting reflex (stimulus-driven saccades)
+    # ═══════════════════════════════════════════════════════════════════
+    if n_gaze > 0:
+        gaze_fan_in = min(15, n_sensory)
+        _fan_in_edges(net, sensory, gaze, gaze_fan_in, ws * genome.w_scale_sensory_to_gaze, rng)
+
+    # Store motor pool info on the DNG for engine use
+    net._position_start = position_start
+    net._action_start = action_start
+    net._done_start = done_start
+    net._commit_start = commit_start
+    net._n_position = n_position
+    net._n_action = n_action
+    net._n_done = n_done
+    net._n_commit = n_commit
 
     return net
-
-
-def _inter_layer_rf_edges(
-    net: DNG,
-    src_layer: np.ndarray,
-    dst_layer: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    n_cells: int,
-    rf_radius: int,
-    connection_prob: float,
-    ws: float,
-    rng: np.random.Generator,
-) -> None:
-    """Connect two topographic layers: each dst neuron samples from src
-    neurons in a spatial neighborhood around its assigned column."""
-    n_src = len(src_layer)
-    n_dst = len(dst_layer)
-    cell_row = np.arange(n_cells) // grid_w
-    cell_col = np.arange(n_cells) % grid_w
-
-    src_cells = np.arange(n_src) % n_cells
-    dst_cells = np.arange(n_dst) % n_cells
-
-    # Group src neurons by cell for fast lookup
-    src_by_cell = [[] for _ in range(n_cells)]
-    for i, c in enumerate(src_cells):
-        src_by_cell[c].append(int(src_layer[i]))
-
-    src_list, dst_list = [], []
-
-    for idx in range(n_dst):
-        dst_node = int(dst_layer[idx])
-        center = dst_cells[idx]
-        cr, cc = cell_row[center], cell_col[center]
-
-        # Gather src neurons from all cells within RF radius
-        candidate_src = []
-        for dr in range(-rf_radius, rf_radius + 1):
-            for dc in range(-rf_radius, rf_radius + 1):
-                nr, nc = cr + dr, cc + dc
-                if 0 <= nr < grid_h and 0 <= nc < grid_w:
-                    cell = nr * grid_w + nc
-                    candidate_src.extend(src_by_cell[cell])
-
-        if not candidate_src:
-            continue
-
-        candidates = np.array(candidate_src, dtype=np.int64)
-        keep = rng.random(len(candidates)) < connection_prob
-        if keep.sum() < 2:
-            keep[:min(2, len(keep))] = True
-        selected = candidates[keep]
-
-        for s in selected:
-            src_list.append(int(s))
-            dst_list.append(dst_node)
-
-    if not src_list:
-        return
-
-    all_src = np.array(src_list, dtype=np.int32)
-    all_dst = np.array(dst_list, dtype=np.int32)
-    valid = all_src != all_dst
-    sel_src = all_src[valid]
-    sel_dst = all_dst[valid]
-
-    magnitudes = _init_weights(rng, ws, len(sel_src))
-    signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
-    sel_w = signs * magnitudes
-    net.add_edges_batch(sel_src, sel_dst, sel_w)
-
-
-def _local_rf_edges(
-    net: DNG,
-    io_start: int,
-    internal: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    n_cells: int,
-    rf_radius: int,
-    long_range_frac: float,
-    ws: float,
-    rng: np.random.Generator,
-    direction: str,
-    n_sensory: int = 0,
-    connection_prob: float = 0.15,
-) -> None:
-    """Spatially structured connections between I/O layer and an internal layer.
-
-    Each neuron samples a RANDOM SUBSET of the available inputs in its
-    receptive field (controlled by connection_prob). This mimics dendritic
-    tree sampling — in real cortex, each neuron contacts only ~5-15% of
-    available thalamic axons, creating the initial diversity that competitive
-    Hebbian learning amplifies into stimulus selectivity.
-    """
-    n_int = len(internal)
-
-    if direction == 'sensory_to_internal':
-        features_per_cell = FEATURES_PER_CELL
-        n_io = n_sensory
-    else:
-        features_per_cell = NUM_COLORS
-        n_io = n_cells * NUM_COLORS
-
-    cell_assignments = np.arange(n_int) % n_cells
-    cell_row = np.arange(n_cells) // grid_w
-    cell_col = np.arange(n_cells) % grid_w
-
-    if direction == 'sensory_to_internal':
-        io_start_val = io_start
-    else:
-        io_start_val = io_start
-
-    src_list, dst_list = [], []
-
-    for idx, int_node in enumerate(internal):
-        center_cell = cell_assignments[idx]
-        cr, cc = cell_row[center_cell], cell_col[center_cell]
-
-        local_cells = []
-        for dr in range(-rf_radius, rf_radius + 1):
-            for dc in range(-rf_radius, rf_radius + 1):
-                nr, nc = cr + dr, cc + dc
-                if 0 <= nr < grid_h and 0 <= nc < grid_w:
-                    local_cells.append(nr * grid_w + nc)
-
-        local_io_nodes = []
-        for cell in local_cells:
-            for k in range(features_per_cell):
-                local_io_nodes.append(io_start_val + cell * features_per_cell + k)
-
-        local_io = np.array(local_io_nodes, dtype=np.int64)
-
-        keep_mask = rng.random(len(local_io)) < connection_prob
-        if keep_mask.sum() < 3:
-            keep_mask[:3] = True
-        selected_local = local_io[keep_mask]
-
-        n_long = max(1, int(len(local_io) * long_range_frac * connection_prob))
-        all_io = np.arange(io_start_val, io_start_val + n_io)
-        n_long = min(n_long, len(all_io))
-        long_range = rng.choice(all_io, size=n_long, replace=False)
-
-        all_connected = np.unique(np.concatenate([
-            selected_local,
-            long_range.astype(np.int64),
-        ]))
-
-        if direction == 'sensory_to_internal':
-            for io_node in all_connected:
-                src_list.append(int(io_node))
-                dst_list.append(int(int_node))
-        else:
-            for io_node in all_connected:
-                src_list.append(int(int_node))
-                dst_list.append(int(io_node))
-
-    if not src_list:
-        return
-
-    all_src = np.array(src_list, dtype=np.int32)
-    all_dst = np.array(dst_list, dtype=np.int32)
-    valid = all_src != all_dst
-    sel_src = all_src[valid]
-    sel_dst = all_dst[valid]
-
-    magnitudes = _init_weights(rng, ws, len(sel_src))
-    signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
-    sel_w = signs * magnitudes
-    net.add_edges_batch(sel_src, sel_dst, sel_w)
 
 
 def _init_weights(
     rng: np.random.Generator, scale: float, n: int,
 ) -> np.ndarray:
-    """Noisy initial weights — small Gaussian perturbation around scale.
-
-    Competitive learning requires initial asymmetry to break symmetry
-    (Rumelhart & Zipser 1985, Krotov & Hopfield 2019). Without it,
-    identical neurons make identical responses and K-H updates average
-    out to zero differentiation.
-    """
     w = rng.normal(loc=scale, scale=scale * 0.35, size=n)
     np.maximum(w, scale * 0.01, out=w)
     return w
@@ -553,8 +351,14 @@ def _fan_in_edges(
     fan_in: int,
     weight_scale: float,
     rng: np.random.Generator,
+    uniform: bool = False,
 ) -> None:
-    """Each dst node gets `fan_in` random connections from src nodes."""
+    """Each dst node gets `fan_in` random connections from src nodes.
+
+    If uniform=True, all weights are set to exactly weight_scale (no noise).
+    Used for L3->MEMORY where random variance creates systematic group biases
+    that interfere with the MBON readout.
+    """
     n_src = len(src_nodes)
     n_dst = len(dst_nodes)
     if n_src == 0 or n_dst == 0 or fan_in <= 0:
@@ -583,46 +387,81 @@ def _fan_in_edges(
     sel_src = all_src[valid]
     sel_dst = all_dst[valid]
 
-    magnitudes = _init_weights(rng, weight_scale, len(sel_src))
+    if uniform:
+        magnitudes = np.full(len(sel_src), weight_scale)
+    else:
+        magnitudes = _init_weights(rng, weight_scale, len(sel_src))
     signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
     sel_w = signs * magnitudes
     net.add_edges_batch(sel_src, sel_dst, sel_w)
 
 
-def _spatial_neighbors(
+def _wire_kc_local(
     net: DNG,
-    region_offset: int,
-    grid_h: int,
-    grid_w: int,
-    density: float,
+    sensory: np.ndarray,
+    layer3: np.ndarray,
+    n_cells: int,
+    local_fan: int,
+    global_fan: int,
     weight_scale: float,
     rng: np.random.Generator,
 ) -> None:
-    """Connect color nodes of 4-connected spatial neighbors."""
-    if density <= 0:
+    """Cell-local KC wiring: each KC is assigned to one grid cell and draws
+    most inputs from that cell's sensory features, with a few from elsewhere.
+
+    Mimics insect MB calyx topography where each KC's dendritic claw
+    samples from a restricted neighborhood of projection neuron boutons.
+    """
+    n_sensory = len(sensory)
+    n_l3 = len(layer3)
+    if n_sensory == 0 or n_l3 == 0 or n_cells == 0:
         return
 
-    src_list, dst_list = [], []
-    for r in range(grid_h):
-        for c in range(grid_w):
-            cell = r * grid_w + c
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < grid_h and 0 <= nc < grid_w:
-                    neighbor = nr * grid_w + nc
-                    for k in range(NUM_COLORS):
-                        src_list.append(region_offset + cell * NUM_COLORS + k)
-                        dst_list.append(region_offset + neighbor * NUM_COLORS + k)
+    features_per_cell = n_sensory // n_cells
+    local_fan = min(local_fan, features_per_cell)
+    total_fan = local_fan + global_fan
 
-    if not src_list:
+    n_kc_per_cell = n_l3 // n_cells
+    remainder = n_l3 % n_cells
+
+    all_src, all_dst = [], []
+    kc_idx = 0
+
+    for cell in range(n_cells):
+        n_kc = n_kc_per_cell + (1 if cell < remainder else 0)
+        if n_kc == 0:
+            continue
+
+        cell_kcs = layer3[kc_idx : kc_idx + n_kc]
+        kc_idx += n_kc
+
+        cell_start = cell * features_per_cell
+        cell_end = cell_start + features_per_cell
+        local_pool = sensory[cell_start:cell_end]
+
+        other_sensory = np.concatenate([
+            sensory[:cell_start], sensory[cell_end:]
+        ]) if (cell_start > 0 or cell_end < n_sensory) else np.array([], dtype=sensory.dtype)
+
+        actual_global = min(global_fan, len(other_sensory))
+
+        for kc in cell_kcs:
+            local_chosen = rng.choice(local_pool, size=local_fan, replace=False)
+
+            if actual_global > 0:
+                global_chosen = rng.choice(other_sensory, size=actual_global, replace=False)
+                src = np.concatenate([local_chosen, global_chosen])
+            else:
+                src = local_chosen
+
+            all_src.append(src)
+            all_dst.append(np.full(len(src), kc, dtype=np.int32))
+
+    if not all_src:
         return
 
-    all_src = np.array(src_list, dtype=np.int32)
-    all_dst = np.array(dst_list, dtype=np.int32)
-    mask = rng.random(len(all_src)) < density
-    sel_src = all_src[mask]
-    sel_dst = all_dst[mask]
-    magnitudes = _init_weights(rng, weight_scale, len(sel_src))
-    signs = np.where(net._mask_I[sel_src], -1.0, 1.0)
-    sel_w = signs * magnitudes
-    net.add_edges_batch(sel_src, sel_dst, sel_w)
+    all_src = np.concatenate(all_src)
+    all_dst = np.concatenate(all_dst)
+    magnitudes = _init_weights(rng, weight_scale, len(all_src))
+    signs = np.where(net._mask_I[all_src], -1.0, 1.0)
+    net.add_edges_batch(all_src, all_dst, signs * magnitudes)

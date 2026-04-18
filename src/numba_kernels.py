@@ -104,6 +104,50 @@ def wta_pool(r, pool_indices, k):
 
 
 @numba.jit(nopython=True, cache=True)
+def wta_pool_soft(r, pool_indices, k):
+    """Soft APL-style inhibition for mushroom body / Kenyon cells.
+
+    Subtracts the (k+1)-th highest rate from all pool neurons, mimicking
+    proportional feedback inhibition from the APL neuron. Unlike hard top-k:
+    - When activity is low (noise only), inhibition is low -> no premature
+      winner locking. Signal can still propagate and build up.
+    - When activity is high (signal arrived), inhibition rises to maintain
+      ~k active neurons, achieving the target sparsity.
+    This naturally handles the signal propagation delay that makes hard
+    WTA unstable in multi-layer networks.
+    """
+    n = len(pool_indices)
+    if n == 0 or k >= n:
+        return
+
+    # Sort descending to find the inhibition threshold
+    rates = np.empty(n)
+    for i in range(n):
+        rates[i] = r[pool_indices[i]]
+
+    order = np.empty(n, dtype=numba.int64)
+    for i in range(n):
+        order[i] = i
+    for i in range(1, n):
+        key_idx = order[i]
+        key_val = rates[key_idx]
+        j = i - 1
+        while j >= 0 and rates[order[j]] < key_val:
+            order[j + 1] = order[j]
+            j -= 1
+        order[j + 1] = key_idx
+
+    threshold = rates[order[k]]
+
+    for i in range(n):
+        idx = pool_indices[i]
+        new_r = r[idx] - threshold
+        if new_r < 0.0:
+            new_r = 0.0
+        r[idx] = new_r
+
+
+@numba.jit(nopython=True, cache=True)
 def wta_columnar(r, pool_indices, col_sizes, col_offsets, n_cols, k_frac):
     """Per-column WTA: each cortical column competes independently.
 
@@ -170,6 +214,7 @@ def run_steps(
     adapt_rate, adapt_decay,
     col_pool, col_sizes, col_offsets, n_cols, wta_k_frac,
     mem_pool_indices, mem_wta_k,
+    l3_pool_indices, l3_wta_k,
     has_signal, n_nodes, n_steps,
     noise_matrix,
     motor_start, n_motor_cells, n_colors,
@@ -235,6 +280,7 @@ def run_steps(
 
         wta_columnar(r, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r, mem_pool_indices, mem_wta_k)
+        wta_pool_soft(r, l3_pool_indices, l3_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
 
@@ -273,11 +319,15 @@ def _eligibility_update_parallel(
     Motor edges need eligibility traces for DA-based reward learning
     (basal ganglia analog). Only K-H competitive plasticity excludes
     motor edges (via edge_plastic in _plasticity_update_parallel).
+
+    Threshold is set low (1e-5) because sparse L3/KC neurons (~0.5% rate)
+    co-activating with motor neurons (~5% rate) produce genuine but tiny
+    co-activity values. Higher thresholds block all reward learning.
     """
     for e in numba.prange(n_edges):
         edge_elig[e] *= elig_decay
         co = r[edge_src[e]] * r[edge_dst[e]]
-        if co > 0.001:
+        if co > 1e-5:
             edge_elig[e] += co
 
 
@@ -442,6 +492,7 @@ def run_steps_plastic(
     adapt_rate, adapt_decay,
     col_pool, col_sizes, col_offsets, n_cols, wta_k_frac,
     mem_pool_indices, mem_wta_k,
+    l3_pool_indices, l3_wta_k,
     has_signal, n_nodes, n_steps,
     noise_matrix,
     motor_start, n_motor_cells, n_colors,
@@ -505,6 +556,7 @@ def run_steps_plastic(
         _col_thresholds(r_pre_wta, col_pool, col_sizes, col_offsets, n_cols, col_mean_r)
         wta_columnar(r, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r, mem_pool_indices, mem_wta_k)
+        wta_pool_soft(r, l3_pool_indices, l3_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
         if r_trace is not None:
@@ -535,6 +587,7 @@ def run_steps_record(
     adapt_rate, adapt_decay,
     col_pool, col_sizes, col_offsets, n_cols, wta_k_frac,
     mem_pool_indices, mem_wta_k,
+    l3_pool_indices, l3_wta_k,
     has_signal, n_nodes, n_steps,
     noise_matrix,
     edge_src, edge_dst, corr, n_edges,
@@ -601,6 +654,7 @@ def run_steps_record(
 
         wta_columnar(r, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r, mem_pool_indices, mem_wta_k)
+        wta_pool_soft(r, l3_pool_indices, l3_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
         for i in range(n_edges):

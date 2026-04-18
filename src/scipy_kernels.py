@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.sparse import csr_matrix
 
-from .numba_kernels import wta_columnar, wta_pool, wta_motor_cells
+from .numba_kernels import wta_columnar, wta_pool, wta_pool_soft, wta_motor_cells
 
 
 def run_steps_plastic_scipy(
@@ -29,6 +29,7 @@ def run_steps_plastic_scipy(
     adapt_rate, adapt_decay,
     col_pool, col_sizes, col_offsets, n_cols, wta_k_frac,
     mem_pool_indices, mem_wta_k,
+    l3_pool_indices, l3_wta_k,
     has_signal, n_nodes, n_steps,
     noise_matrix,
     motor_start, n_motor_cells, n_colors,
@@ -119,6 +120,7 @@ def run_steps_plastic_scipy(
         # --- WTA (numba-compiled, fast for small pools) ---
         wta_columnar(r, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r, mem_pool_indices, mem_wta_k)
+        wta_pool_soft(r, l3_pool_indices, l3_wta_k)
         wta_motor_cells(r, motor_start, n_motor_cells, n_colors)
 
         # --- Eligibility traces (vectorized) ---

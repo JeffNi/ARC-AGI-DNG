@@ -44,6 +44,7 @@ def gpu_run_steps_v2(
     adapt_rate, adapt_decay,
     col_pool, col_sizes, col_offsets, n_cols, wta_k_frac,
     mem_pool_indices, mem_wta_k,
+    l3_pool_indices, l3_wta_k,
     has_signal, n_nodes, n_steps,
     noise_matrix,
     motor_start, n_motor_cells, n_colors,
@@ -62,7 +63,7 @@ def gpu_run_steps_v2(
     Uses cuSPARSE for the sparse matmul with active-input normalization.
     WTA and column means run on CPU (Numba) where they're faster.
     """
-    from .numba_kernels import wta_columnar, wta_pool, wta_motor_cells as _wta_motor
+    from .numba_kernels import wta_columnar, wta_pool, wta_pool_soft, wta_motor_cells as _wta_motor
 
     _free_gpu_pool()
 
@@ -153,6 +154,7 @@ def gpu_run_steps_v2(
         r_pre_cpu = cp.asnumpy(d_r_pre_wta)
         wta_columnar(r_cpu, col_pool, col_sizes, col_offsets, n_cols, wta_k_frac)
         wta_pool(r_cpu, mem_pool_indices, mem_wta_k)
+        wta_pool_soft(r_cpu, l3_pool_indices, l3_wta_k)
         _wta_motor(r_cpu, motor_start, n_motor_cells, n_colors)
         d_r = cp.asarray(r_cpu)
 

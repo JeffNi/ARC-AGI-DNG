@@ -1,44 +1,40 @@
 """
 Evaluator — snapshot evaluation of brain capability.
 
-Loads a checkpoint, runs all tasks with full neural dynamics but no
-permanent learning. The circuit executes (signals propagate, WTA competes,
-activity settles) but weights are never modified. State is reset between
-tasks so each eval starts from the same baseline.
+Runs tasks with full neural dynamics but no learning or reward.
+The brain perceives through gaze, acts via sequential motor commits,
+and its canvas is scored against the expected output.
 
-This answers: "if I froze this brain right now, what can it actually do?"
+No weight changes, no reward delivery during evaluation.
 """
 
 from __future__ import annotations
 
 import json
-import copy
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
 from .brain import Brain
+from .display_buffer import DisplayBuffer
 from .genome import Genome
-from .encoding import grid_to_signal, pad_grid, NUM_COLORS
-from .perception.encoder import FEATURES_PER_CELL
+from .encoding import pad_grid, NUM_COLORS
 
 
 @dataclass
 class EvalResult:
-    """Result from evaluating one task."""
     task_type: str
     task_id: str
     correct: bool
     cell_accuracy: float
     n_demos_shown: int
+    total_commits: int = 0
 
 
 @dataclass
 class TypeReport:
-    """Aggregate results for one task type."""
     task_type: str
     total: int = 0
     solved: int = 0
@@ -51,7 +47,6 @@ class TypeReport:
 
 @dataclass
 class EvalReport:
-    """Full evaluation report."""
     checkpoint_age: int
     stage: str
     n_edges: int
@@ -97,34 +92,34 @@ class EvalReport:
 
 class Evaluator:
     """
-    Snapshot evaluator. Loads a brain checkpoint, runs tasks with full
-    neural dynamics (thinking) but no learning (no reward, no CHL,
-    no weight modification). State reset between tasks.
+    Snapshot evaluator. Full neural dynamics, no learning or reward.
+    Brain perceives through gaze, commits actions to canvas, scored at end.
     """
 
     def __init__(
         self,
         brain: Brain,
         task_dir: str = "micro_tasks",
-        observe_steps: int = 50,
-        attempt_steps: int = 80,
+        observe_steps: int = 40,
+        action_steps: int = 150,
         n_demos: int | None = None,
     ):
         self.brain = brain
         self.task_dir = Path(task_dir)
         self.observe_steps = observe_steps
-        self.attempt_steps = attempt_steps
-        # If n_demos is None, use the brain's current stage setting
+        self.action_steps = action_steps
         self._n_demos_override = n_demos
+
+        self.display_buffer = DisplayBuffer(
+            brain.net.max_h, brain.net.max_w,
+        )
 
         self._tasks_by_type: dict[str, list[dict]] = {}
         self._load_tasks()
 
-        # Snapshot the initial state for resets between tasks
         self._save_transient_state()
 
     def _load_tasks(self):
-        """Load all task files, filtering oversized ones."""
         if not self.task_dir.exists():
             return
         max_h = self.brain.net.max_h
@@ -157,8 +152,6 @@ class Evaluator:
         return True
 
     def _save_transient_state(self):
-        """Snapshot firing rates, voltages, eligibility, facilitation, adaptation.
-        Weights are NOT saved here — they're already frozen (never modified)."""
         net = self.brain.net
         self._snap_r = net.r.copy()
         self._snap_V = net.V.copy()
@@ -170,7 +163,6 @@ class Evaluator:
         self._snap_da = self.brain.neuromod.da
 
     def _restore_transient_state(self):
-        """Reset to pre-eval baseline. Weights untouched (never modified)."""
         net = self.brain.net
         net.r[:] = self._snap_r
         net.V[:] = self._snap_V
@@ -178,9 +170,12 @@ class Evaluator:
         net.f[:] = self._snap_f
         net.adaptation[:] = self._snap_adaptation
         ne = net._edge_count
-        net._edge_eligibility[:ne] = self._snap_elig
+        n_snap = len(self._snap_elig)
+        n_copy = min(ne, n_snap)
+        net._edge_eligibility[:n_copy] = self._snap_elig[:n_copy]
         self.brain.neuromod.da = self._snap_da
         self.brain.clear_signal()
+        self.brain.reset_canvas()
 
     def _eval_n_demos(self) -> int:
         if self._n_demos_override is not None:
@@ -190,56 +185,83 @@ class Evaluator:
 
     def eval_single(self, task_type: str, task: dict) -> EvalResult:
         """
-        Evaluate one task. Full dynamics, no learning.
+        Evaluate one task. Full dynamics, no learning, no reward.
 
         Flow:
-          1. Reset transient state to clean baseline
-          2. Show demos (full dynamics — brain "thinks" about examples)
-          3. Show test input, let brain settle, read motor output
-          4. Compare — no reward, no CHL, no weight changes
+          1. Reset transient state + canvas
+          2. Load task into display buffer
+          3. Guide gaze through demo pairs (observe via gaze)
+          4. Guide gaze to test input, let brain act autonomously
+          5. Read canvas when DONE or max steps, compare to expected
         """
         self._restore_transient_state()
 
         h = self.brain.net.max_h
         w = self.brain.net.max_w
         pairs = task.get("train", [])
-        if not pairs:
+        test_pairs = task.get("test", [])
+        if not pairs and not test_pairs:
             return EvalResult(task_type, task.get("_file", "?"), False, 0.0, 0)
 
         n_demos = min(self._eval_n_demos(), len(pairs))
 
-        # --- Demos: brain sees examples with full dynamics ---
-        demo_pairs = pairs[:n_demos]
-        for dp in demo_pairs:
-            dp_in = pad_grid(np.array(dp["input"], dtype=np.int32), h, w)
-            dp_out = pad_grid(np.array(dp["output"], dtype=np.int32), h, w)
+        # Load task
+        n_loaded = self.display_buffer.load_task(task)
 
-            sensory = grid_to_signal(dp_in, max_h=h, max_w=w)
-            motor = self._motor_signal(dp_out, h, w)
+        # --- Demos via gaze ---
+        steps_per_slot = max(5, self.observe_steps // max(1, n_loaded * 2 + 1))
+        for slot in range(n_loaded * 2):
+            self.brain.guide_gaze(slot, strength=0.8)
+            self.brain.step_with_gaze(
+                self.display_buffer,
+                n_steps=steps_per_slot,
+                learn=False,
+            )
 
-            self.brain.inject_teaching_signal(sensory, motor)
-            self.brain.step(n_steps=self.observe_steps)
-            self.brain.clear_signal()
-            self.brain.step(n_steps=5)
+        # Guide to test input
+        test_slot = n_loaded * 2
+        self.brain.guide_gaze(test_slot, strength=0.8)
+        self.brain.step_with_gaze(
+            self.display_buffer,
+            n_steps=steps_per_slot,
+            learn=False,
+        )
 
-        # --- Attempt: input only, brain produces output ---
-        remaining = [p for p in pairs if p not in demo_pairs]
-        test_pair = remaining[0] if remaining else pairs[-1]
-        input_grid = pad_grid(np.array(test_pair["input"], dtype=np.int32), h, w)
-        expected_grid = pad_grid(np.array(test_pair["output"], dtype=np.int32), h, w)
-        out_h, out_w = expected_grid.shape
+        # --- Action phase: deterministic position cycling, no reward ---
+        # Use the same motor loop as training so the brain's color
+        # selection is exercised at every position. No reward or
+        # depression — this purely reads out what the brain would pick.
+        self.brain.reset_canvas()
 
-        signal = grid_to_signal(input_grid, max_h=h, max_w=w)
-        self.brain.inject_signal(signal)
-        self.brain.step(n_steps=self.attempt_steps)
+        test_input = pad_grid(
+            np.array((test_pairs[0] if test_pairs else pairs[-1])["input"],
+                     dtype=np.int32),
+            h, w,
+        )
+        self.brain.set_observed_colors(test_input)
 
-        output_grid = self.brain.read_motor(out_h, out_w)
+        self.brain.clear_gaze_bias()
+        self.brain.guide_gaze(test_slot, strength=0.4)
+        self.brain.apply_gaze(self.display_buffer)
+
+        n_cells = h * w
+        total_commits = n_cells
+        for pos in range(n_cells):
+            self.brain.commit_at_position(pos, expected_grid=None)
+
+        # --- Score ---
+        if test_pairs:
+            expected = pad_grid(np.array(test_pairs[0]["output"], dtype=np.int32), h, w)
+        else:
+            expected = pad_grid(np.array(pairs[-1]["output"], dtype=np.int32), h, w)
+
+        canvas = self.brain.get_canvas_grid(h, w)
         self.brain.clear_signal()
+        self.brain.clear_gaze_bias()
 
-        # --- Score (no reward, no CHL) ---
-        correct = np.array_equal(output_grid, expected_grid)
-        n_cells = out_h * out_w
-        cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
+        correct = np.array_equal(canvas, expected)
+        n_cells = h * w
+        cell_acc = float(np.sum(canvas == expected)) / n_cells
 
         return EvalResult(
             task_type=task_type,
@@ -247,23 +269,10 @@ class Evaluator:
             correct=correct,
             cell_accuracy=cell_acc,
             n_demos_shown=n_demos,
+            total_commits=total_commits,
         )
 
-    def _motor_signal(self, grid: np.ndarray, h: int, w: int) -> np.ndarray:
-        """One-hot motor signal from grid."""
-        n_cells = h * w
-        motor = np.zeros(n_cells * NUM_COLORS, dtype=np.float64)
-        for i in range(n_cells):
-            r, c = divmod(i, w)
-            color = int(grid[r, c])
-            motor[i * NUM_COLORS + color] = 1.0
-        return motor
-
     def run_full_eval(self, console: bool = True) -> EvalReport:
-        """
-        Evaluate ALL tasks across ALL types.
-        Returns a structured report.
-        """
         report = EvalReport(
             checkpoint_age=self.brain.age,
             stage=self.brain.stage_manager.current_stage,
@@ -291,7 +300,8 @@ class Evaluator:
                 if console:
                     tag = "PASS" if result.correct else "fail"
                     print(f"  [{tag}] {task_type}/{result.task_id} "
-                          f"cell_acc={result.cell_accuracy:.1%}"
+                          f"cell_acc={result.cell_accuracy:.1%} "
+                          f"commits={result.total_commits}"
                           f"  ({done}/{total})", flush=True)
 
             type_report.mean_cell_acc = float(np.mean(cell_accs)) if cell_accs else 0.0
@@ -304,7 +314,6 @@ class Evaluator:
         return report
 
     def save_report(self, report: EvalReport, path: str | Path):
-        """Save eval report as JSON."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -332,6 +341,7 @@ class Evaluator:
                     "correct": r.correct,
                     "cell_accuracy": r.cell_accuracy,
                     "n_demos": r.n_demos_shown,
+                    "commits": r.total_commits,
                 }
                 for r in report.results
             ],
@@ -347,10 +357,6 @@ def evaluate_checkpoint(
     n_demos: int | None = None,
     console: bool = True,
 ) -> EvalReport:
-    """
-    Convenience: load a checkpoint and run full evaluation.
-    Returns the report. Doesn't modify the checkpoint.
-    """
     if genome is None:
         genome = Genome()
     brain = Brain.resume(genome, checkpoint_dir=checkpoint_dir)

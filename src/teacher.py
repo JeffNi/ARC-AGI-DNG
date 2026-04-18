@@ -1,13 +1,15 @@
 """
-Teacher — external caregiver that feeds tasks and manages reward.
+Experimenter — minimal external interface for task presentation.
 
-The Teacher:
-  - Loads tasks from the micro_tasks directory
-  - Manages a mastery-based curriculum (must solve ALL tasks of a type)
-  - Feeds input signals, observes output, computes reward
-  - Sets DA based on reward prediction error
-  - Tracks per-type performance
-  - Periodically retests previously mastered types
+The experimenter can ONLY:
+  - Load tasks into the display buffer
+  - Clear the answer canvas to blank
+  - Provide light gaze bias (pointing at demo pairs and test input)
+  - Pass expected grid to the reward circuit (answer key)
+  - Read the canvas when DONE fires or max steps, score it
+
+The experimenter CANNOT: inject signals directly into the brain,
+set DA, manipulate weights, or perform any "neurosurgery".
 """
 
 from __future__ import annotations
@@ -16,17 +18,14 @@ import json
 import random
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
 from .brain import Brain
 from .display_buffer import DisplayBuffer
-from .encoding import grid_to_signal, pad_grid, NUM_COLORS
-from .episodic_memory import EpisodicMemory
+from .encoding import pad_grid, NUM_COLORS
 from .gaze_log import GazeLogger
 from .monitor import Monitor
-from .rule_verifiers import verify_rule
 
 
 @dataclass
@@ -36,6 +35,7 @@ class TypeTracker:
     solves: int = 0
     consecutive_solves: int = 0
     mastered: bool = False
+    failed: bool = False
     last_tested_age: int = 0
 
     @property
@@ -45,7 +45,7 @@ class TypeTracker:
 
 @dataclass
 class CurriculumState:
-    """State of the mastery-based curriculum."""
+    """State of the mastery-based curriculum with failure timeout."""
     current_tier: int = 0
     type_trackers: dict[str, TypeTracker] = field(default_factory=dict)
     day: int = 0
@@ -54,7 +54,12 @@ class CurriculumState:
 
 
 class Teacher:
-    """External caregiver for the brain."""
+    """Minimal experimenter for autonomous mushroom body learning."""
+
+    # Max attempts per task type before declaring failure and advancing
+    MAX_ATTEMPTS_PER_TYPE = 30
+    # Consecutive correct solves required for mastery
+    MASTERY_THRESHOLD = 3
 
     def __init__(
         self,
@@ -63,10 +68,8 @@ class Teacher:
         display_buffer: DisplayBuffer | None = None,
         gaze_logger: GazeLogger | None = None,
         task_dir: str = "micro_tasks",
-        mastery_threshold: int = 3,
-        retest_interval: int = 50,
-        observe_steps: int = 50,
-        attempt_steps: int = 80,
+        observe_steps: int | None = None,
+        action_steps: int | None = None,
         **kwargs,
     ):
         self.brain = brain
@@ -76,94 +79,158 @@ class Teacher:
         )
         self.gaze_logger = gaze_logger
         self.task_dir = Path(task_dir)
-        self.mastery_threshold = mastery_threshold
-        self.retest_interval = retest_interval
-        self.observe_steps = observe_steps
-        self.attempt_steps = attempt_steps
+        # Read timing from genome unless caller overrides
+        self.observe_steps = observe_steps if observe_steps is not None else brain.genome.observe_steps
+        self.action_steps = action_steps if action_steps is not None else brain.genome.action_budget
 
         self.state = CurriculumState()
         self._tasks_by_type: dict[str, list[dict]] = {}
         self._tier_order: list[str] = []
-
-        self.episodic_memory = EpisodicMemory(
-            max_h=brain.net.max_h, max_w=brain.net.max_w,
-        )
+        self._last_task_type: str | None = None
 
         self._load_tasks()
         self._generate_micro_tasks()
 
     def _generate_micro_tasks(self):
-        """Generate simple pixel-manipulation tasks programmatically.
-
-        These are the earliest curriculum tier — they test whether the
-        learned motor pathways can produce specific outputs.  Micro-tasks
-        are deliberately trivial so the network can succeed early in
-        childhood and build momentum for harder tasks.
-        """
+        """Generate tiered tasks scaled to grid size."""
         h, w = self.brain.net.max_h, self.brain.net.max_w
         rng = np.random.default_rng(42)
-        tasks: list[dict] = []
 
+        def _rand_grid(rng, h, w, n_colors=3, density=0.5):
+            g = [[0] * w for _ in range(h)]
+            colors = [int(rng.integers(1, NUM_COLORS)) for _ in range(n_colors)]
+            for r in range(h):
+                for c in range(w):
+                    if rng.random() < density:
+                        g[r][c] = colors[int(rng.integers(0, len(colors)))]
+            return g
+
+        def _copy_grid(g):
+            return [row[:] for row in g]
+
+        # --- Tier 0: Identity ---
+        t0 = []
         for i in range(20):
-            kind = i % 3
-            if kind == 0:
-                # Single pixel: blank -> one pixel colored
-                train_pairs, test_pair = [], None
-                for _ in range(3):
-                    inp = [[0] * w for _ in range(h)]
-                    out = [[0] * w for _ in range(h)]
-                    r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
-                    color = int(rng.integers(1, NUM_COLORS))
-                    out[r][c] = color
-                    train_pairs.append({"input": inp, "output": out})
-                inp = [[0] * w for _ in range(h)]
-                out = [[0] * w for _ in range(h)]
-                r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
-                out[r][c] = int(rng.integers(1, NUM_COLORS))
-                test_pair = {"input": inp, "output": out}
-            elif kind == 1:
-                # Pixel copy: sparse input -> same output (mini-identity)
-                train_pairs, test_pair = [], None
-                for _ in range(3):
-                    grid = [[0] * w for _ in range(h)]
-                    n_px = int(rng.integers(1, 4))
-                    for _ in range(n_px):
-                        r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
-                        grid[r][c] = int(rng.integers(1, NUM_COLORS))
-                    train_pairs.append({"input": grid, "output": grid})
-                grid = [[0] * w for _ in range(h)]
-                for _ in range(int(rng.integers(1, 4))):
-                    r, c = int(rng.integers(0, h)), int(rng.integers(0, w))
-                    grid[r][c] = int(rng.integers(1, NUM_COLORS))
-                test_pair = {"input": grid, "output": grid}
-            else:
-                # Color fill: blank -> one row filled
-                train_pairs, test_pair = [], None
-                for _ in range(3):
-                    inp = [[0] * w for _ in range(h)]
-                    out = [[0] * w for _ in range(h)]
-                    row = int(rng.integers(0, h))
-                    color = int(rng.integers(1, NUM_COLORS))
-                    out[row] = [color] * w
-                    train_pairs.append({"input": inp, "output": out})
-                inp = [[0] * w for _ in range(h)]
-                out = [[0] * w for _ in range(h)]
-                row = int(rng.integers(0, h))
-                out[row] = [int(rng.integers(1, NUM_COLORS))] * w
-                test_pair = {"input": inp, "output": out}
-
-            tasks.append({
-                "train": train_pairs,
-                "test": [test_pair],
-                "_file": f"micro_{i:03d}.json",
-                "_tier": "tier_micro",
+            pairs = []
+            for _ in range(3):
+                g = _rand_grid(rng, h, w, n_colors=2, density=0.4)
+                pairs.append({"input": g, "output": _copy_grid(g)})
+            tg = _rand_grid(rng, h, w, n_colors=2, density=0.4)
+            t0.append({
+                "train": pairs, "test": [{"input": tg, "output": _copy_grid(tg)}],
+                "_file": f"identity_{i:03d}", "_tier": "gen_identity", "type": "identity",
             })
+        self._tasks_by_type["gen_identity"] = t0
+        self._tier_order.append("gen_identity")
 
-        self._tasks_by_type["tier_micro"] = tasks
-        self._tier_order.append("tier_micro")
+        # --- Tier 1: Solid fill ---
+        t1 = []
+        for i in range(20):
+            pairs = []
+            for _ in range(3):
+                fill_color = int(rng.integers(1, NUM_COLORS))
+                g = [[0] * w for _ in range(h)]
+                for r in range(h):
+                    for c in range(w):
+                        if rng.random() < 0.6:
+                            g[r][c] = fill_color
+                        elif rng.random() < 0.3:
+                            g[r][c] = int(rng.integers(1, NUM_COLORS))
+                out = [[fill_color] * w for _ in range(h)]
+                pairs.append({"input": g, "output": out})
+            fill_color = int(rng.integers(1, NUM_COLORS))
+            g = [[0] * w for _ in range(h)]
+            for r in range(h):
+                for c in range(w):
+                    if rng.random() < 0.6:
+                        g[r][c] = fill_color
+                    elif rng.random() < 0.3:
+                        g[r][c] = int(rng.integers(1, NUM_COLORS))
+            out = [[fill_color] * w for _ in range(h)]
+            t1.append({
+                "train": pairs, "test": [{"input": tg, "output": _copy_grid(tg)}],
+                "_file": f"solid_fill_{i:03d}", "_tier": "gen_solid_fill", "type": "solid_fill",
+            })
+            # Fix: use the actual fill output for this task
+            t1[-1]["test"] = [{"input": g, "output": out}]
+        self._tasks_by_type["gen_solid_fill"] = t1
+        self._tier_order.append("gen_solid_fill")
+
+        # --- Tier 2: Color swap ---
+        t2 = []
+        for i in range(20):
+            ca = int(rng.integers(1, NUM_COLORS))
+            cb = int(rng.integers(1, NUM_COLORS))
+            while cb == ca:
+                cb = int(rng.integers(1, NUM_COLORS))
+            pairs = []
+            for _ in range(3):
+                g = _rand_grid(rng, h, w, n_colors=2, density=0.5)
+                g[0][0] = ca
+                g[h-1][w-1] = cb
+                out = _copy_grid(g)
+                for r in range(h):
+                    for c in range(w):
+                        if out[r][c] == ca:
+                            out[r][c] = cb
+                        elif out[r][c] == cb:
+                            out[r][c] = ca
+                pairs.append({"input": g, "output": out})
+            tg = _rand_grid(rng, h, w, n_colors=2, density=0.5)
+            tg[0][0] = ca
+            tg[h-1][w-1] = cb
+            to = _copy_grid(tg)
+            for r in range(h):
+                for c in range(w):
+                    if to[r][c] == ca:
+                        to[r][c] = cb
+                    elif to[r][c] == cb:
+                        to[r][c] = ca
+            t2.append({
+                "train": pairs, "test": [{"input": tg, "output": to}],
+                "_file": f"color_swap_{i:03d}", "_tier": "gen_color_swap", "type": "color_swap",
+            })
+        self._tasks_by_type["gen_color_swap"] = t2
+        self._tier_order.append("gen_color_swap")
+
+        # --- Tier 3: Horizontal flip ---
+        t3 = []
+        for i in range(20):
+            pairs = []
+            for _ in range(3):
+                g = _rand_grid(rng, h, w, n_colors=3, density=0.5)
+                out = [row[::-1] for row in g]
+                pairs.append({"input": g, "output": out})
+            tg = _rand_grid(rng, h, w, n_colors=3, density=0.5)
+            to = [row[::-1] for row in tg]
+            t3.append({
+                "train": pairs, "test": [{"input": tg, "output": to}],
+                "_file": f"flip_h_{i:03d}", "_tier": "gen_flip_h", "type": "flip_h",
+            })
+        self._tasks_by_type["gen_flip_h"] = t3
+        self._tier_order.append("gen_flip_h")
+
+        # --- Tier 4: Color extract ---
+        t4 = []
+        for i in range(20):
+            target = int(rng.integers(1, NUM_COLORS))
+            pairs = []
+            for _ in range(3):
+                g = _rand_grid(rng, h, w, n_colors=3, density=0.6)
+                g[int(rng.integers(0, h))][int(rng.integers(0, w))] = target
+                out = [[g[r][c] if g[r][c] == target else 0 for c in range(w)] for r in range(h)]
+                pairs.append({"input": g, "output": out})
+            tg = _rand_grid(rng, h, w, n_colors=3, density=0.6)
+            tg[int(rng.integers(0, h))][int(rng.integers(0, w))] = target
+            to = [[tg[r][c] if tg[r][c] == target else 0 for c in range(w)] for r in range(h)]
+            t4.append({
+                "train": pairs, "test": [{"input": tg, "output": to}],
+                "_file": f"color_extract_{i:03d}", "_tier": "gen_color_extract", "type": "color_extract",
+            })
+        self._tasks_by_type["gen_color_extract"] = t4
+        self._tier_order.append("gen_color_extract")
 
     def _task_fits(self, task: dict) -> bool:
-        """Check if all grids in a task fit within the brain's max dimensions."""
         max_h = self.brain.net.max_h
         max_w = self.brain.net.max_w
         for pair in task.get("train", []) + task.get("test", []):
@@ -174,7 +241,6 @@ class Teacher:
         return True
 
     def _load_tasks(self):
-        """Load all tasks from the micro_tasks directory structure."""
         if not self.task_dir.exists():
             self.monitor.status(f"Task directory not found: {self.task_dir}")
             return
@@ -207,26 +273,16 @@ class Teacher:
                            f" (filtered {skipped} oversized)")
 
     def current_type(self) -> str | None:
-        """Get the current task type to train on."""
         if not self._tier_order:
             return None
         idx = min(self.state.current_tier, len(self._tier_order) - 1)
         return self._tier_order[idx]
 
     def pick_task(self) -> tuple[str, dict] | None:
-        """Pick the next task: current type, retest, or advance."""
+        """Pick next task: varied within tier, no blocked practice."""
         if not self._tier_order:
             return None
 
-        # Occasionally retest a mastered type
-        mastered = [t for t, tr in self.state.type_trackers.items()
-                    if tr.mastered and (self.brain.age - tr.last_tested_age) > self.retest_interval]
-        if mastered and random.random() < 0.15:
-            retest_type = random.choice(mastered)
-            task = random.choice(self._tasks_by_type[retest_type])
-            return retest_type, task
-
-        # Current type
         task_type = self.current_type()
         if task_type is None:
             return None
@@ -238,220 +294,106 @@ class Teacher:
         task = random.choice(tasks)
         return task_type, task
 
-    def _build_spotlight_signal(
-        self,
-        input_grid: np.ndarray,
-        output_grid: np.ndarray,
-        h: int, w: int,
-        strength: float = 1.5,
-    ) -> np.ndarray:
-        """
-        Build a sensory signal with attention spotlighting: cells that
-        CHANGE between input and output get boosted signal strength.
-        Like a parent pointing: "look HERE at what changed."
-        """
-        signal = grid_to_signal(input_grid, max_h=h, max_w=w)
-        if strength <= 1.0:
-            return signal
-
-        from .perception.encoder import FEATURES_PER_CELL
-        n_cells = h * w
-        for i in range(min(n_cells, input_grid.size, output_grid.size)):
-            r, c = divmod(i, w)
-            if r < input_grid.shape[0] and c < input_grid.shape[1]:
-                in_val = input_grid[r, c]
-            else:
-                in_val = 0
-            if r < output_grid.shape[0] and c < output_grid.shape[1]:
-                out_val = output_grid[r, c]
-            else:
-                out_val = 0
-            if in_val != out_val:
-                base = i * FEATURES_PER_CELL
-                end = base + FEATURES_PER_CELL
-                signal[base:end] *= strength
-        return signal
-
-    def _motor_signal_from_grid(self, grid: np.ndarray, h: int, w: int) -> np.ndarray:
-        """Encode an output grid as a motor teaching signal (one-hot per cell)."""
-        padded = pad_grid(grid, h, w)
-        n_cells = h * w
-        motor = np.zeros(n_cells * NUM_COLORS, dtype=np.float64)
-        for i in range(n_cells):
-            r, c = divmod(i, w)
-            color = int(padded[r, c])
-            motor[i * NUM_COLORS + color] = 1.0
-        return motor
-
-    def _gaze_step(self, slot_idx: int, n_steps: int,
-                   strength: float = 0.5, **step_kwargs) -> int:
-        """Guide gaze to a slot, apply it, step, and log.
-
-        Returns the slot the network actually fixated on (may differ
-        from slot_idx if guidance strength is low and the network
-        overrides).
-        """
-        self.brain.guide_gaze(slot_idx, strength)
-        actual_slot = self.brain.apply_gaze(self.display_buffer)
-        self.brain.step(n_steps=n_steps, **step_kwargs)
-        if self.gaze_logger:
-            stype = self.display_buffer.slot_types[actual_slot]
-            self.gaze_logger.record(self.brain.age, actual_slot, stype)
-        return actual_slot
-
     def run_task(self, task_type: str, task: dict) -> bool:
         """
-        Present a single task via display buffer + guided gaze.
-
-        Visual-only teaching -- no external motor injection. The copy
-        pathway drives motor neurons when the network sees the answer.
+        Autonomous learning loop. The experimenter is NOT a neurosurgeon.
 
         Flow:
-          1. Load task into display buffer (slots: [in1, out1, ...test, answer]).
-          2. Sequential demos: guide gaze to input slot, then output slot.
-             Copy pathway sees output and drives motor naturally.
-          3. Episodic recall.
-          4. Attempt loop (max 3 tries): guide gaze to test input,
-             read motor output, evaluate. If wrong: global DA + show
-             correct answer visually + CHL (free vs clamped).
-          5. Rest + consolidation.
+          1. Load task into display buffer, clear canvas, reset eligibility
+          2. Light gaze bias through demos (observation phase)
+          3. Gaze bias to test input, then brain explores freely (action phase)
+          4. Brain commits actions autonomously, gets per-action food/shock
+          5. DONE fires or max steps -> read canvas, compute accuracy
+          6. Global DA for DONE + GAZE learning
+          7. Brief rest
         """
         h = self.brain.net.max_h
         w = self.brain.net.max_w
 
+        self._last_task_type = task_type
+
         pairs = task.get("train", [])
-        if not pairs:
+        test_pairs = task.get("test", [])
+        if not pairs and not test_pairs:
             return False
 
-        sp = self.brain.stage_manager.current_setpoints()
-        n_demos = sp.n_demos
+        # Use last training pair as test if no explicit test
+        if test_pairs:
+            test_pair = test_pairs[0]
+        else:
+            test_pair = pairs[-1]
 
-        # --- Load task into display buffer ---
-        n_loaded = self.display_buffer.load_task(task)
-        gaze_strength = 0.5  # moderate guidance during childhood
-
-        # --- Phase 1: Sequential demonstrations via gaze ---
-        # Visual only: guide gaze to input, then output. The copy pathway
-        # sees the output and drives motor neurons naturally -- no external
-        # motor injection needed.
-        self.episodic_memory.clear()
-        demo_pairs = pairs[:n_demos] if n_demos > 0 else []
-        for pair_idx, dp in enumerate(demo_pairs):
-            dp_in = pad_grid(np.array(dp["input"], dtype=np.int32), h, w)
-            dp_out = pad_grid(np.array(dp["output"], dtype=np.int32), h, w)
-            self.episodic_memory.store(dp_in, dp_out)
-
-            in_slot = pair_idx * 2
-            out_slot = pair_idx * 2 + 1
-
-            self._gaze_step(in_slot, n_steps=15, strength=gaze_strength)
-            self._gaze_step(out_slot, n_steps=20, strength=gaze_strength)
-
-            self.brain.clear_signal()
-            self.brain.clear_gaze_bias()
-            self.brain.step(n_steps=5)
-
-        # --- Phase 2: Episodic recall (sensory, not motor) ---
-        remaining = [p for p in pairs if p not in demo_pairs]
-        test_pair = random.choice(remaining) if remaining else random.choice(pairs)
-        input_grid = pad_grid(np.array(test_pair["input"], dtype=np.int32), h, w)
         expected_grid = pad_grid(np.array(test_pair["output"], dtype=np.int32), h, w)
-        out_h, out_w = expected_grid.shape
 
-        recalled = self.episodic_memory.recall_as_sensory(input_grid, h, w)
-        if recalled is not None:
-            self.brain.inject_signal(recalled)
-            self.brain.step(n_steps=5, learn=False)
-            self.brain.clear_signal()
-            self.brain.step(n_steps=5)
+        # ── 1. Load task, clear canvas, reset traces ──
+        n_demos = self.display_buffer.load_task(task)
+        self.brain.reset_canvas()
+        self.brain.reset_eligibility_traces()
 
-        # --- Phase 3: Attempt loop (max 3 tries) ---
-        # Visual-only teaching: network attempts freely, then sees the
-        # correct answer via gaze. CHL captures the contrast. Global DA
-        # signals overall accuracy; three-factor learning + CHL provide
-        # cell-level specificity.
-        test_slot = next(
-            (i for i, t in enumerate(self.display_buffer.slot_types)
-             if t == "test_input"),
-            0,
+        # ── 2. Observation phase: gaze at test input only ──
+        # The brain observes the test input to build an L3 representation.
+        # Demo grids are skipped — the brain doesn't yet understand what
+        # "demo pairs" mean, so gazing at them adds noise, not signal.
+        test_slot = n_demos * 2
+        self.brain.guide_gaze(test_slot, strength=0.4)
+        self.brain.step_with_gaze(
+            self.display_buffer,
+            gaze_logger=self.gaze_logger,
+            n_steps=self.observe_steps,
+            learn=True,
         )
-        answer_slot = self.display_buffer.answer_slot
 
-        motor_nodes = self.brain.net.output_nodes
+        # ── 3. Action phase: deterministic position cycling ──
+        # The teacher walks the brain through every cell, like a bee
+        # visiting each flower. The brain picks a color at each stop.
+        # This guarantees full grid coverage so depression can accumulate.
+        self.brain.reset_canvas()
 
-        correct = False
-        n_attempts = 0
-        cell_acc = 0.0
-        mean_change = 0.0
-        last_free_corr = None
-        max_attempts = 3
+        # Set observed-color constraint AFTER reset_canvas (which clears it).
+        test_grid = pad_grid(np.array(test_pair["input"], dtype=np.int32), h, w)
+        self.brain.set_observed_colors(test_grid)
 
-        for attempt in range(max_attempts):
-            n_attempts = attempt + 1
-
-            self.brain.net.V[motor_nodes] = 0.0
-            self.brain.net.r[motor_nodes] = 0.0
-            self.brain.net.adaptation[motor_nodes] = 0.0
-
-            ne = self.brain.net._edge_count
-            self.brain.net._edge_eligibility[:ne] = 0.0
-
-            # Free phase: guide gaze to test input, let network process
-            self._gaze_step(test_slot, n_steps=10,
-                            strength=gaze_strength, clamp_sensory=True)
-            output_grid = self.brain.read_motor(out_h, out_w)
-
-            self.display_buffer.write_answer(output_grid)
-            if self.gaze_logger:
-                self.gaze_logger.record(
-                    self.brain.age, answer_slot, "answer", motor_event=True,
-                )
-
-            rule_type = task.get("type", "")
-            correct = verify_rule(rule_type, input_grid, output_grid,
-                                  expected_grid, task)
-            n_cells = out_h * out_w
-            cell_acc = float(np.sum(output_grid == expected_grid)) / n_cells
-
-            # Global DA based on overall accuracy
-            da = 0.1 + 0.3 * cell_acc
-            if correct:
-                da += 0.1
-            self.brain.set_da(da)
-
-            if correct:
-                break
-
-            # Snapshot free-phase correlations (network's own attempt)
-            last_free_corr = self.brain.snapshot_correlations(n_steps=15)
-
-            # Clamped phase: show correct answer visually via gaze.
-            # Copy pathway sees the answer and drives motor naturally.
-            self.display_buffer.write_answer(expected_grid)
-            self._gaze_step(answer_slot, n_steps=20, strength=gaze_strength)
-            clamped_corr = self.brain.snapshot_correlations(n_steps=15)
-
-            mean_change = self.brain.apply_chl(last_free_corr, clamped_corr)
-
-            self.brain.clear_signal()
-            self.brain.clear_gaze_bias()
-            self.brain.step(n_steps=5)
-
-        if correct and last_free_corr is None:
-            free_corr = self.brain.snapshot_correlations(n_steps=15)
-            self.brain.store_replay(free_corr, free_corr)
-
-        # --- Phase 4: Rest + spontaneous replay ---
-        self.brain.clear_signal()
+        # Keep test input visible — the sensory signal drives copy bias
+        # and L3 representation. Gaze stays on test input throughout.
         self.brain.clear_gaze_bias()
-        self.brain.step(n_steps=10)
-        self.brain.spontaneous_replay(n_steps=10, strength=0.2)
+        self.brain.guide_gaze(test_slot, strength=0.4)
+        self.brain.apply_gaze(self.display_buffer)
+
+        n_cells = h * w
+        commit_log = []
+        total_dw = 0.0
+        max_dw = 0.0
+
+        for pos in range(n_cells):
+            detail = self.brain.commit_at_position(pos, expected_grid)
+            commit_log.append(detail)
+            dw = abs(detail.get("mean_dw", 0.0))
+            total_dw += dw
+            if dw > max_dw:
+                max_dw = dw
+
+        # ── 4. Score the canvas ──
+        canvas = self.brain.get_canvas_grid(h, w)
+        cell_acc = float(np.sum(canvas == expected_grid)) / n_cells
+        correct = np.array_equal(canvas, expected_grid)
+
+        # ── 5. Global DA for DONE + GAZE learning ──
+        g = self.brain.genome
+        global_da = g.da_reward_offset + g.da_reward_slope * cell_acc
+        if correct:
+            global_da = max(global_da, g.da_reward_floor)
+        self.brain.apply_reward(global_da)
+
+        # ── 6. Rest period ──
+        self.brain.clear_gaze_bias()
+        self.brain.clear_signal()
+        self.brain.step(n_steps=5)
 
         sleep_stats = self.brain.try_sleep()
         if sleep_stats:
             self.monitor.sleep_event(sleep_stats, self.brain.age)
 
-        # Update tracking
+        # ── 7. Update tracking ──
         tracker = self.state.type_trackers.setdefault(task_type, TypeTracker())
         tracker.attempts += 1
         tracker.last_tested_age = self.brain.age
@@ -461,58 +403,89 @@ class Teacher:
         else:
             tracker.consecutive_solves = 0
 
-        if not tracker.mastered and tracker.consecutive_solves >= self.mastery_threshold:
-            all_tasks = self._tasks_by_type.get(task_type, [])
-            if tracker.solves >= len(all_tasks):
+        # Mastery check
+        if not tracker.mastered and not tracker.failed:
+            if tracker.consecutive_solves >= self.MASTERY_THRESHOLD:
                 tracker.mastered = True
                 self.monitor.status(f"MASTERED: {task_type}")
+                self._advance_tier()
+            elif tracker.attempts >= self.MAX_ATTEMPTS_PER_TYPE:
+                tracker.failed = True
+                self.monitor.status(f"FAILED (timeout): {task_type} after {tracker.attempts} attempts")
                 self._advance_tier()
 
         self.state.tasks_today += 1
         if correct:
             self.state.solves_today += 1
 
-        pixel_correct = np.array_equal(output_grid, expected_grid)
+        mbon_weights = self.brain.get_mbon_weight_summary()
+
         self.monitor.task_result(
             task_type=task_type,
             task_id=task.get("_file", "unknown"),
             correct=correct,
             reward=cell_acc,
-            mean_change=mean_change,
+            mean_change=max_dw,
             age=self.brain.age,
             extra={
                 "cell_accuracy": cell_acc,
-                "pixel_match": pixel_correct,
-                "rule_type": rule_type,
-                "n_demos": len(demo_pairs),
-                "n_attempts": n_attempts,
+                "total_commits": n_cells,
+                "done_fired": False,
+                "mbon_weights": mbon_weights,
+                "commits": commit_log,
             },
         )
 
+        self.last_cell_acc = cell_acc
         return correct
 
     def _advance_tier(self):
-        """Advance to next tier if current is mastered."""
-        current = self.current_type()
-        tracker = self.state.type_trackers.get(current)
-        if tracker and tracker.mastered:
-            if self.state.current_tier < len(self._tier_order) - 1:
-                self.state.current_tier += 1
-                new_type = self.current_type()
-                self.monitor.status(f"Advanced to tier {self.state.current_tier}: {new_type}")
+        if self.state.current_tier < len(self._tier_order) - 1:
+            self.state.current_tier += 1
+            new_type = self.current_type()
+            self.monitor.status(f"Advanced to tier {self.state.current_tier}: {new_type}")
+
+    MAX_RETRIES_PER_INSTANCE = 10
 
     def run_day(self, max_tasks: int = 50) -> dict:
-        """Run a full day of tasks."""
+        """Run a full day: cycle through task types in blocks.
+
+        For each task type:
+          1. Reset MBON weights (fresh start for this type).
+          2. Retry the *same* task instance until solved or MAX_RETRIES hit.
+             Depression accumulates across retries — this is the core learning loop.
+          3. Once solved (or retries exhausted), move to the next instance
+             of the same type — MBON weights persist so the brain must
+             generalize the learned rule.
+          4. After exhausting the budget for this type, move to the next type.
+        """
         self.state.tasks_today = 0
         self.state.solves_today = 0
         self.state.day += 1
 
-        for _ in range(max_tasks):
-            pick = self.pick_task()
-            if pick is None:
-                break
-            task_type, task = pick
-            self.run_task(task_type, task)
+        gen_types = [t for t in self._tasks_by_type if t.startswith("gen_")]
+        if not gen_types:
+            gen_types = list(self._tasks_by_type.keys())
+
+        trials_per_type = max(1, max_tasks // max(1, len(gen_types)))
+
+        for task_type in gen_types:
+            tasks = self._tasks_by_type.get(task_type, [])
+            if not tasks:
+                continue
+            trials_used = 0
+            task_idx = 0
+
+            while trials_used < trials_per_type and task_idx < len(tasks):
+                task = tasks[task_idx]
+                for retry in range(self.MAX_RETRIES_PER_INSTANCE):
+                    if trials_used >= trials_per_type:
+                        break
+                    solved = self.run_task(task_type, task)
+                    trials_used += 1
+                    if solved:
+                        break
+                task_idx += 1
 
         n_mastered = sum(1 for t in self.state.type_trackers.values() if t.mastered)
         self.monitor.day_summary(
@@ -525,7 +498,6 @@ class Teacher:
             age=self.brain.age,
         )
 
-        # Autosave
         if self.brain.checkpointer.should_autosave():
             self.brain.save()
 

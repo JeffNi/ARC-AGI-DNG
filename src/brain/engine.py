@@ -1,9 +1,9 @@
 """
 Brain engine — the always-on continuous neural system.
 
-This is the core loop. When the brain is "on", it steps continuously.
-The Teacher feeds it stimuli and rewards. DA gates learning.
-Sleep happens when fatigue builds up.
+Autonomous mushroom body: the brain perceives through gaze, acts one cell
+at a time via POSITION+ACTION commit stability, and learns from per-action
+food/shock (DA to winning neurons only). No neurosurgery.
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ from typing import Callable
 
 from ..graph import DNG, Region, layer_index
 from ..genome import Genome
-from ..encoding import grid_to_signal, signal_to_grid, NUM_COLORS
+from ..encoding import grid_to_signal, NUM_COLORS
+from ..perception.encoder import FEATURES_PER_CELL
 from ..numba_kernels import run_steps_plastic, wta_motor_cells, accumulate_corr
 from ..plasticity import (
     eligibility_modulated_update,
@@ -26,6 +27,9 @@ from ..plasticity import (
     get_weight_snapshot,
     synaptogenesis,
     lateral_decorrelation,
+    depression_update_l3_memory,
+    potentiation_update_l3_memory,
+    recovery_l3_memory,
 )
 from ..homeostasis import Homeostasis, HomeostasisSetpoints, StageManager
 from .neuromodulators import NeuromodState
@@ -36,11 +40,11 @@ from .checkpoint import Checkpointer
 
 class Brain:
     """
-    Continuous brain engine. Always on until externally stopped.
+    Continuous brain engine with autonomous mushroom body architecture.
 
-    The Brain doesn't know about tasks or curricula — it just processes
-    signals, learns from DA, and sleeps when tired. The Teacher handles
-    everything pedagogical.
+    Motor output: 9 POSITION + 11 ACTION + 1 DONE + 1 COMMIT neurons.
+    Commits one cell at a time when COMMIT neuron fires above threshold
+    (basal ganglia go/no-go gate). Canvas tracks the answer being built.
     """
 
     def __init__(
@@ -55,6 +59,23 @@ class Brain:
         self.genome = genome
         self.rng = rng or np.random.default_rng()
 
+        # All behavioral constants read from genome (single source of truth)
+        self.COMMIT_GAIN = genome.commit_gain
+        self.COMMIT_NOISE = genome.commit_noise
+        self.COMMIT_LR = genome.commit_lr
+        self.REFRACTORY_STEPS = genome.refractory_steps
+        self.GAZE_REFLEX_STEPS = genome.gaze_reflex_steps
+        self.DONE_NOISE_BOOST = genome.done_noise
+        self.MIN_COMMITS_BEFORE_DONE = genome.min_commits_before_done
+        self.AUTO_SUBMIT_STEPS = genome.auto_submit_steps
+        self.ACTION_NOISE_COEFF = genome.action_noise_coeff
+        self.ACTION_EXPLORE_NOISE = genome.action_explore_noise
+        self.SUPPRESS_STEPS = genome.suppress_steps
+        self.SUPPRESS_STRENGTH = genome.suppress_strength
+        self.MBON_STRENGTH = genome.mbon_strength
+        self.COPY_BIAS = genome.copy_bias
+        self.ATTENTION_GAIN = genome.attention_gain
+
         self.neuromod = NeuromodState(
             da_baseline=genome.da_baseline_rest,
             da_decay=genome.da_decay,
@@ -66,13 +87,9 @@ class Brain:
         )
         self.checkpointer = Checkpointer(checkpoint_dir=checkpoint_dir)
 
-        # Pre-WTA firing rates (dendritic calcium analog).
-        # The kernel writes here before WTA suppresses r. Used by
-        # homeostasis for EMA tracking of actual input drive.
         self._r_pre_wta = np.zeros(net.n_nodes, dtype=np.float64)
 
-        # Homeostasis: continuous self-regulation
-        self.stage_manager = stage_manager or StageManager(initial_stage="infancy")
+        self.stage_manager = stage_manager or StageManager(initial_stage="operational")
         self.homeostasis = Homeostasis(
             net,
             self.stage_manager.current_setpoints(),
@@ -80,17 +97,15 @@ class Brain:
             r_pre_wta=self._r_pre_wta,
         )
 
-        self.age = 0  # total steps lived
-        self.birth_edges = net._edge_count  # snapshot at birth for density regulation
-        self._replay_buffer: list = []  # (free_corr, clamped_corr, da_tag) for CHL replay
-        self._signal_buffer: list = []  # recent sensory signals for spontaneous replay
+        self.age = 0
+        self.birth_edges = net._edge_count
+        self._replay_buffer: list = []
+        self._signal_buffer: list = []
         self._max_replay = 50
 
-        # Novelty detector: automatic DA from stimulus unfamiliarity.
-        # Brain compares incoming signals to a running EMA of recent input.
         n_sensory = len(net.input_nodes)
         self._recent_signal_ema = np.zeros(n_sensory, dtype=np.float64)
-        self._novelty_sensitivity = 0.5  # scaled by StageManager
+        self._novelty_sensitivity = 0.5
         self._novelty_ema_rate = 0.1
 
         # Pre-compute region indices
@@ -101,30 +116,44 @@ class Brain:
         self._gate_idx = np.where(net.regions == _reg.index(Region.GATE))[0].astype(np.int64)
         self._gaze_idx = np.where(net.regions == _reg.index(Region.GAZE))[0].astype(np.int64)
         self._gaze_bias = np.zeros(len(self._gaze_idx), dtype=np.float64)
-        self._motor_start = int(net.output_nodes[0]) if len(net.output_nodes) > 0 else net.n_nodes
-        self._n_motor_cells = len(net.output_nodes) // NUM_COLORS if len(net.output_nodes) > 0 else 0
 
-        # Region indices for edge masking
+        # Motor pool indices (new architecture)
+        self._position_idx = np.where(net.regions == _reg.index(Region.POSITION))[0].astype(np.int64)
+        self._action_idx = np.where(net.regions == _reg.index(Region.ACTION))[0].astype(np.int64)
+        self._done_idx = np.where(net.regions == _reg.index(Region.DONE))[0].astype(np.int64)
+        self._commit_idx = np.where(net.regions == _reg.index(Region.COMMIT))[0].astype(np.int64)
+
+        self._n_position = len(self._position_idx)
+        self._n_action = len(self._action_idx)
+
+        # MBON compartment lookup: which MEMORY neurons belong to which color group
+        if hasattr(net, '_memory_group_ids') and net._memory_group_ids is not None:
+            self._memory_group_ids = net._memory_group_ids
+            self._n_memory_groups = getattr(net, '_n_memory_groups', NUM_COLORS)
+        else:
+            self._memory_group_ids = np.full(len(self._memory_idx), -1, dtype=np.int32)
+            self._n_memory_groups = 0
+
+        self._mbon_readout_cache = None
+
+        # For backward compat with kernel motor WTA (we handle our own WTA now)
+        self._motor_start = int(self._position_idx[0]) if len(self._position_idx) > 0 else net.n_nodes
+        self._n_motor_cells = 0  # disable old per-cell WTA in kernel
+
         self._sensory_reg = _reg.index(Region.SENSORY)
         self._motor_reg = _reg.index(Region.MOTOR)
 
-        # Per-layer indices for diagnostics
         self._l1_idx = np.where(net.regions == _reg.index(Region.LOCAL_DETECT))[0].astype(np.int64)
         self._l2_idx = np.where(net.regions == _reg.index(Region.MID_LEVEL))[0].astype(np.int64)
         self._l3_idx = np.where(net.regions == _reg.index(Region.ABSTRACT))[0].astype(np.int64)
 
-        # Per-column WTA pools: L1 and L2 have separate column spaces
-        # (L1: 0..n_cells-1, L2: n_cells..2*n_cells-1) so they compete
-        # within-layer, not across layers.
-        #
-        # L3 (mushroom body / Kenyon cells) has NO column assignment.
-        # Competition is handled by APL-style global inhibition instead
-        # of columnar WTA. L3 neurons keep column_id = -1, so the K-H
-        # kernel uses h_star = 0 for them (plasticity is mostly frozen
-        # on L2->L3 edges anyway; learning happens at L3->MOTOR).
+        # L3 global WTA pool (APL analog)
+        self._l3_pool_indices = self._l3_idx.copy()
+        self._l3_wta_k = max(1, int(self.genome.apl_target_sparseness * len(self._l3_idx)))
+
+        # Column pools for internal WTA
         max_col = int(net.column_ids.max()) + 1 if len(net.column_ids) > 0 else 0
         n_cols = max(max_col, 1)
-
         self._node_col_id = net.column_ids.astype(np.int64).copy()
 
         col_buckets = [[] for _ in range(n_cols)]
@@ -144,253 +173,270 @@ class Brain:
             running += len(col_buckets[i])
         self._col_offsets = offsets
         self._n_cols = n_cols
-
-        # Per-column mean post-WTA rate buffer (written by kernel each step)
         self._col_mean_r = np.zeros(n_cols, dtype=np.float64)
 
-        # Refractory suppression for cortical + memory neurons.
+        # Refractory suppression mask (internal + memory + gate + gaze)
         self._refractory_mask = np.zeros(net.n_nodes, dtype=np.bool_)
         self._refractory_mask[self._internal_idx] = True
         self._refractory_mask[self._memory_idx] = True
         self._refractory_mask[self._gate_idx] = True
         self._refractory_mask[self._gaze_idx] = True
 
-        # Cached per-edge cortical layer classification (invalidated on edge count change)
         self._edge_layer_cache: np.ndarray | None = None
 
+        # ── Sequential motor state ──
+        self._canvas = np.zeros(self._n_position, dtype=np.int32)
+        self._committed = np.zeros(self._n_position, dtype=np.bool_)
+        self._pos_winner_history: list[int] = []
+        self._act_winner_history: list[int] = []
+        self._steps_since_commit = 0
+        self._total_commits = 0
+        self._pos_refractory = np.zeros(self._n_position, dtype=np.int32)
+        self._gaze_reflex_countdown = 0
+        self._done_fired = False
+
+        # ── Lose-shift exploration (basal ganglia indirect pathway) ──
+        # After a wrong commit, suppress that action for SUPPRESS_STEPS to
+        # force the WTA toward alternatives. Not random — directed away from
+        # the known-bad answer.
+        self._suppress_group: int = -1
+        self._suppress_countdown: int = 0
+
+        # ── Observed-color constraint ──
+        # Boolean mask: which colors appeared in the test input during
+        # observation. ACTION neurons for unseen colors get suppressed,
+        # narrowing the search space from 10 to ~2-3 candidates.
+        self._observed_colors = np.ones(NUM_COLORS, dtype=np.bool_)
+
+        # ── Spatial attention (per-position KC gain factors) ──
+        # Pre-compute how strongly each KC is connected to each cell's
+        # sensory nodes. Used for proportional gain modulation at commit time.
+        self._attended_kc_gains: dict[int, np.ndarray] = {}
+        self._build_attended_kc_gains()
+
+    def _build_attended_kc_gains(self):
+        """Pre-compute per-KC gain factors for each grid position.
+
+        For position i, each KC gets a gain proportional to what fraction
+        of its SENSORY inputs come from cell i's sensory nodes [i*10, i*10+10).
+        A KC with 3/10 inputs from cell i gets gain = 1 + 0.3 * (attention_gain - 1).
+        A KC with 0/10 inputs gets gain = 1.0 (no boost).
+
+        This is more position-specific than binary masks because most KCs
+        have 0-1 connections from any given cell (out of ~10 total inputs).
+        """
+        ne = self.net._edge_count
+        src = self.net._edge_src[:ne]
+        dst = self.net._edge_dst[:ne]
+
+        _reg = list(Region)
+        sensory_r = _reg.index(Region.SENSORY)
+        abstract_r = _reg.index(Region.ABSTRACT)
+
+        s2l3 = ((self.net.regions[src] == sensory_r) &
+                (self.net.regions[dst] == abstract_r))
+        s2l3_idx = np.where(s2l3)[0]
+
+        l3_to_local = {int(g): i for i, g in enumerate(self._l3_idx)}
+
+        # Count total SENSORY inputs per KC
+        total_inputs = np.zeros(len(self._l3_idx), dtype=np.float64)
+        for ei in s2l3_idx:
+            d = int(dst[ei])
+            if d in l3_to_local:
+                total_inputs[l3_to_local[d]] += 1.0
+        total_inputs = np.maximum(total_inputs, 1.0)
+
+        n_positions = self._n_position
+        for pos in range(n_positions):
+            cell_base = pos * FEATURES_PER_CELL
+            cell_end = cell_base + FEATURES_PER_CELL
+            cell_inputs = np.zeros(len(self._l3_idx), dtype=np.float64)
+            for ei in s2l3_idx:
+                s = int(src[ei])
+                if cell_base <= s < cell_end:
+                    d = int(dst[ei])
+                    if d in l3_to_local:
+                        cell_inputs[l3_to_local[d]] += 1.0
+            fraction = cell_inputs / total_inputs
+            self._attended_kc_gains[pos] = fraction
+
+    # ── Sensory injection ─────────────────────────────────────────
+
     def inject_signal(self, signal: np.ndarray):
-        """
-        Inject a sensory signal into the network.
-
-        Resets sensory V/r before applying the new signal so the retinal
-        input immediately represents the new stimulus. Without this,
-        residual sensory state from the previous stimulus persists and
-        corrupts the copy pathway's color selection.
-
-        Automatically computes novelty (how different this signal is from
-        recent input) and spikes DA proportionally. This is the basal
-        ganglia's novelty/orienting response — no Teacher involvement.
-        """
+        """Inject a sensory signal. Computes novelty DA automatically."""
         n_sensory = len(self.net.input_nodes)
         sensory_part = signal[:n_sensory]
 
-        # Novelty = mean absolute difference from recent signal EMA
         novelty = float(np.mean(np.abs(sensory_part - self._recent_signal_ema)))
         self._recent_signal_ema = (
             (1.0 - self._novelty_ema_rate) * self._recent_signal_ema
             + self._novelty_ema_rate * sensory_part
         )
 
-        # DA spike proportional to novelty, capped
-        da_spike = min(novelty * self._novelty_sensitivity, 0.4)
+        da_spike = min(novelty * self._novelty_sensitivity, self.genome.da_novelty_cap)
         if da_spike > 0.01:
             new_da = self.neuromod.da_baseline + da_spike
             self.neuromod.set_da(new_da)
             self.net.da = new_da
 
-        # Clear sensory residuals — new retinal input replaces old
         self.net.V[:n_sensory] = 0.0
         self.net.r[:n_sensory] = 0.0
 
-        # Boost color channel signal to dominate L1→sensory feedback.
-        # L1 feedback grows to ±2-5 via K-H plasticity during infancy.
-        # Color channels at 1.0 get overwhelmed. At 5.0, retinal input
-        # always wins (like real thalamocortical drive to V1).
-        from ..perception.encoder import FEATURES_PER_CELL as _FPC
-        boosted = sensory_part.copy()
-        n_cells = self.net.max_h * self.net.max_w
-        for c in range(n_cells):
-            base = c * _FPC
-            if base + NUM_COLORS <= n_sensory:
-                boosted[base:base + NUM_COLORS] *= 5.0
-
         sig = np.zeros(self.net.n_nodes)
-        sig[:n_sensory] = boosted
+        sig[:n_sensory] = sensory_part
         self._current_signal = sig
-
-    def inject_teaching_signal(
-        self,
-        sensory_signal: np.ndarray,
-        motor_signal: np.ndarray,
-    ):
-        """
-        Inject both input (sensory) and correct output (motor) simultaneously.
-        Used during demonstrations: the brain sees the answer being produced
-        while observing the input, like a parent guiding a child's hand.
-        Novelty DA is computed from the sensory part only.
-        """
-        n_sensory = len(self.net.input_nodes)
-        sensory_part = sensory_signal[:n_sensory]
-
-        # Novelty from sensory input
-        novelty = float(np.mean(np.abs(sensory_part - self._recent_signal_ema)))
-        self._recent_signal_ema = (
-            (1.0 - self._novelty_ema_rate) * self._recent_signal_ema
-            + self._novelty_ema_rate * sensory_part
-        )
-        da_spike = min(novelty * self._novelty_sensitivity, 0.4)
-        if da_spike > 0.01:
-            new_da = self.neuromod.da_baseline + da_spike
-            self.neuromod.set_da(new_da)
-            self.net.da = new_da
-
-        # Boost color channels (same as inject_signal)
-        from ..perception.encoder import FEATURES_PER_CELL as _FPC
-        boosted = sensory_part.copy()
-        n_cells = self.net.max_h * self.net.max_w
-        for c in range(n_cells):
-            base = c * _FPC
-            if base + NUM_COLORS <= n_sensory:
-                boosted[base:base + NUM_COLORS] *= 5.0
-
-        sig = np.zeros(self.net.n_nodes)
-        sig[:n_sensory] = boosted
-        # Drive motor neurons with the correct output
-        n_motor = len(self.net.output_nodes)
-        motor_part = motor_signal[:n_motor]
-        motor_start = int(self.net.output_nodes[0])
-        sig[motor_start:motor_start + n_motor] = motor_part
-        self._current_signal = sig
-
-    def add_motor_hint(self, motor_signal: np.ndarray, strength: float = 0.3):
-        """Blend a soft motor bias into the current signal (hippocampal recall)."""
-        if self._current_signal is None:
-            return
-        n_motor = len(self.net.output_nodes)
-        self._current_signal[self._motor_start:self._motor_start + n_motor] += (
-            motor_signal[:n_motor] * strength
-        )
 
     def clear_signal(self):
         self._current_signal = None
 
     def set_da(self, level: float):
-        """Teacher sets DA (reward prediction error)."""
         self.neuromod.set_da(level)
         self.net.da = level
 
-    def _normalize_incoming_weights(self, ne: int):
-        """Normalize each internal neuron's incoming excitatory weights to a fixed L2 norm.
+    # ── Canvas management ─────────────────────────────────────────
 
-        Vectorized: computes per-neuron squared norms via np.add.at, then
-        rescales all edges in one pass. Only scales DOWN neurons that exceed
-        the target norm — never amplifies weak neurons.
+    def reset_canvas(self):
+        """Clear the answer canvas to blank (all zeros)."""
+        self._canvas[:] = 0
+        self._committed[:] = False
+        self._pos_winner_history.clear()
+        self._act_winner_history.clear()
+        self._steps_since_commit = 0
+        self._total_commits = 0
+        self._pos_refractory[:] = 0
+        self._gaze_reflex_countdown = 0
+        self._done_fired = False
+        self._suppress_group = -1
+        self._suppress_countdown = 0
+        self._observed_colors[:] = True  # permissive until observation constrains it
+
+    def get_canvas_grid(self, h: int, w: int) -> np.ndarray:
+        """Read current canvas as a 2D grid."""
+        n_cells = h * w
+        grid = np.zeros(n_cells, dtype=np.int32)
+        grid[:min(n_cells, len(self._canvas))] = self._canvas[:min(n_cells, len(self._canvas))]
+        return grid.reshape(h, w)
+
+    def reset_eligibility_traces(self):
+        """Zero all eligibility traces (between-task boundary)."""
+        ne = self.net._edge_count
+        self.net._edge_eligibility[:ne] = 0.0
+
+    def set_observed_colors(self, grid: np.ndarray):
+        """Extract which colors appear in a grid and set the constraint mask.
+
+        During the action phase, ACTION neurons for colors NOT in this set
+        get suppressed, narrowing WTA competition to ~2-3 plausible colors.
         """
-        w = self.net._edge_w[:ne]
-        dst = self.net._edge_dst[:ne]
-        cons = self.net._edge_consolidation[:ne]
+        self._observed_colors[:] = False
+        unique_colors = np.unique(grid)
+        for c in unique_colors:
+            ci = int(c)
+            if 0 <= ci < NUM_COLORS:
+                self._observed_colors[ci] = True
 
-        # Only normalize edges from sensory neurons — memory and lateral
-        # edges serve different purposes and shouldn't be constrained.
-        _reg = list(Region)
-        sensory_idx = _reg.index(Region.SENSORY)
-        src = self.net._edge_src[:ne]
-        src_is_sensory = self.net.regions[src] == sensory_idx
+    def reset_mbon_weights(self):
+        """Restore L3->MEMORY weights to their initial values.
 
-        exc_mask = (w > 0) & (cons < 1.0) & src_is_sensory
-        if exc_mask.sum() == 0:
+        Called between task types to prevent cross-task interference.
+        Within-type persistence enables generalization.
+        """
+        if not (hasattr(self.net, '_l3_mem_initial_w') and
+                hasattr(self.net, '_l3_mem_edge_slice')):
             return
-
-        target_norm_sq = (self.genome.weight_scale * 30.0) ** 2
-
-        sq_sums = np.zeros(self.net.n_nodes, dtype=np.float64)
-        np.add.at(sq_sums, dst[exc_mask], w[exc_mask] ** 2)
-
-        needs_scale = sq_sums > target_norm_sq * 1.44  # 1.2^2
-        if not np.any(needs_scale):
+        sl_start, sl_end = self.net._l3_mem_edge_slice
+        ne = self.net._edge_count
+        actual_end = min(sl_end, ne)
+        if sl_start >= actual_end:
             return
-
-        scale_factors = np.ones(self.net.n_nodes, dtype=np.float64)
-        mask = needs_scale & (sq_sums > 1e-16)
-        scale_factors[mask] = np.sqrt(target_norm_sq / sq_sums[mask])
-
-        per_edge_scale = scale_factors[dst]
-        w[exc_mask] *= per_edge_scale[exc_mask]
+        n = actual_end - sl_start
+        self.net._edge_w[sl_start:actual_end] = self.net._l3_mem_initial_w[:n].copy()
         self.net._csr_dirty = True
 
-    def decorrelate_layers(self, eta: float = 0.01, sim_threshold: float = 0.4):
-        """Apply anti-Hebbian lateral decorrelation with layer-specific strength.
-
-        L2 gets stronger decorrelation to counteract the trace rule's
-        convergence pressure. L1 and L3 use the default parameters.
-        """
-        total = 0
-        layer_params = [
-            (self._l1_idx, eta, sim_threshold),
-            (self._l2_idx, eta * 3.0, max(sim_threshold - 0.1, 0.15)),
-            (self._l3_idx, eta, sim_threshold),
-        ]
-        for layer_idx, layer_eta, layer_thresh in layer_params:
-            if len(layer_idx) > 0:
-                total += lateral_decorrelation(
-                    self.net, layer_idx,
-                    eta=layer_eta, sim_threshold=layer_thresh,
-                )
-        return total
-
-    def _get_memory_gate_mask(self, ne: int) -> np.ndarray:
-        """Cached mask: external→memory edges (excludes memory→memory self-loops).
-
-        Used by DA-gated memory write: these edges are scaled by DA level
-        so high DA (demos) opens the gate and low DA (attempt/rest) lets
-        the attractor maintain its state.
-        """
-        cached = getattr(self, '_memory_gate_cache', None)
-        if cached is not None and len(cached) == ne:
-            return cached
-        dst = self.net._edge_dst[:ne]
-        src = self.net._edge_src[:ne]
-        mem_reg = list(Region).index(Region.MEMORY)
-        dst_is_mem = self.net.regions[dst] == mem_reg
-        src_is_mem = self.net.regions[src] == mem_reg
-        mask = dst_is_mem & ~src_is_mem
-        self._memory_gate_cache = mask
-        return mask
+    # ── Plasticity masks ──────────────────────────────────────────
 
     def _get_edge_plastic(self, ne: int) -> np.ndarray:
-        """Cached boolean mask: True for edges eligible for Hebbian plasticity.
+        """Boolean mask: True for edges eligible for Hebbian/eligibility plasticity.
 
-        Motor-targeted edges learn via eligibility traces only, so they
-        are excluded here.  After infancy, L1 edges are also locked —
-        V1 critical period closes early (Hensch 2005) and L1 should be
-        a stable feature extractor, not rewritten by task-driven DA.
+        Plastic pathways:
+          L3->POSITION, L3->DONE, L3->COMMIT  (spatial targeting + go gate)
+          L3->MEMORY                           (depression site — KC→MBON)
+          MEMORY->POSITION/DONE/COMMIT         (MBON output for spatial/completion/gate)
+          POSITION->COMMIT, ACTION->COMMIT     (motor plan → go gate)
+          L3->GAZE                             (gaze strategy)
 
-        Invalidated when edges are added/removed or stage transitions.
+        NOT plastic (handled by other mechanisms):
+          MEMORY->ACTION: fixed structured wiring (consolidated)
         """
         cached = getattr(self, '_edge_plastic_cache', None)
         if cached is not None and len(cached) == ne:
             return cached
-        mask = np.ones(ne, dtype=np.bool_)
-        motor_idx = list(Region).index(Region.MOTOR)
-        mask[self.net.regions[self.net._edge_dst[:ne]] == motor_idx] = False
 
-        stage = self.stage_manager.current_stage
-        if stage not in ("infancy",):
-            edge_layers = self._get_edge_layer_class()
-            mask[edge_layers == 0] = False
+        _reg = list(Region)
+        src_reg = self.net.regions[self.net._edge_src[:ne]]
+        dst_reg = self.net.regions[self.net._edge_dst[:ne]]
+
+        abstract_r = _reg.index(Region.ABSTRACT)
+        memory_r = _reg.index(Region.MEMORY)
+        position_r = _reg.index(Region.POSITION)
+        action_r = _reg.index(Region.ACTION)
+        done_r = _reg.index(Region.DONE)
+        commit_r = _reg.index(Region.COMMIT)
+        gaze_r = _reg.index(Region.GAZE)
+
+        mask = np.zeros(ne, dtype=np.bool_)
+
+        src_is_l3 = src_reg == abstract_r
+        dst_is_commit = dst_reg == commit_r
+
+        # L3 -> POSITION/DONE/COMMIT
+        mask |= src_is_l3 & (dst_reg == position_r)
+        mask |= src_is_l3 & (dst_reg == done_r)
+        mask |= src_is_l3 & dst_is_commit
+        # L3 -> MEMORY (depression learning site)
+        mask |= src_is_l3 & (dst_reg == memory_r)
+
+        # MEMORY -> POSITION/DONE/COMMIT
+        src_is_mem = src_reg == memory_r
+        mask |= src_is_mem & (dst_reg == position_r)
+        mask |= src_is_mem & (dst_reg == done_r)
+        mask |= src_is_mem & dst_is_commit
+
+        # POSITION -> COMMIT, ACTION -> COMMIT (motor plan informs go gate)
+        mask |= (src_reg == position_r) & dst_is_commit
+        mask |= (src_reg == action_r) & dst_is_commit
+
+        # L3 -> GAZE
+        mask |= src_is_l3 & (dst_reg == gaze_r)
+
+        # Exclude consolidated edges (instinct wiring, MEMORY→ACTION)
+        cons = self.net._edge_consolidation[:ne]
+        mask &= cons < 10.0
 
         self._edge_plastic_cache = mask
         return mask
 
-    def _get_edge_l1_to_l2(self, ne: int) -> np.ndarray:
-        """Cached boolean mask: True for edges where src is L1 and dst is L2."""
-        cached = getattr(self, '_edge_l1_to_l2_cache', None)
+    def _get_edge_l3_to_motor(self, ne: int) -> np.ndarray:
+        """Cached mask: L3 -> any motor pool (POSITION/ACTION/DONE/COMMIT)."""
+        cached = getattr(self, '_edge_l3_to_motor_cache', None)
         if cached is not None and len(cached) == ne:
             return cached
-        l1_reg = list(Region).index(Region.LOCAL_DETECT)
-        l2_reg = list(Region).index(Region.MID_LEVEL)
-        src_is_l1 = self.net.regions[self.net._edge_src[:ne]] == l1_reg
-        dst_is_l2 = self.net.regions[self.net._edge_dst[:ne]] == l2_reg
-        mask = src_is_l1 & dst_is_l2
-        self._edge_l1_to_l2_cache = mask
+        _reg = list(Region)
+        l3_reg = _reg.index(Region.ABSTRACT)
+        pos_reg = _reg.index(Region.POSITION)
+        act_reg = _reg.index(Region.ACTION)
+        done_reg = _reg.index(Region.DONE)
+        commit_reg = _reg.index(Region.COMMIT)
+        src_is_l3 = self.net.regions[self.net._edge_src[:ne]] == l3_reg
+        dst_reg = self.net.regions[self.net._edge_dst[:ne]]
+        dst_is_motor = ((dst_reg == pos_reg) | (dst_reg == act_reg) |
+                        (dst_reg == done_reg) | (dst_reg == commit_reg))
+        mask = src_is_l3 & dst_is_motor
+        self._edge_l3_to_motor_cache = mask
         return mask
 
     def _get_edge_into_l3(self, ne: int) -> np.ndarray:
-        """Cached boolean mask: True for edges where dst is L3 (Kenyon cells).
-
-        Used to freeze PN->KC (L2->L3, L1->L3, sensory->L3) plasticity
-        after infancy — the random conjunction wiring IS the representation.
-        """
         cached = getattr(self, '_edge_into_l3_cache', None)
         if cached is not None and len(cached) == ne:
             return cached
@@ -400,12 +446,6 @@ class Brain:
         return mask
 
     def _get_edge_layer_class(self) -> np.ndarray:
-        """Classify each edge by the highest cortical layer it touches.
-
-        0 = L1 (or non-cortical), 1 = L2, 2 = L3. Used to build per-edge
-        decay scale arrays for layer-aware pruning: higher layers get
-        reduced decay during early development.
-        """
         n = self.net._edge_count
         if self._edge_layer_cache is not None and len(self._edge_layer_cache) == n:
             return self._edge_layer_cache
@@ -416,27 +456,573 @@ class Brain:
         self._edge_layer_cache = np.maximum(src_layers, dst_layers)
         return self._edge_layer_cache
 
+    def _invalidate_edge_caches(self):
+        """Invalidate all edge-count-dependent caches."""
+        self._edge_plastic_cache = None
+        self._edge_layer_cache = None
+        self._edge_l3_to_motor_cache = None
+        self._edge_into_l3_cache = None
+        self._mbon_readout_cache = None
+        attrs = ['_memory_gate_cache', '_sensory_motor_cache',
+                 '_edge_l1_to_l2_cache']
+        for a in attrs:
+            if hasattr(self, a):
+                setattr(self, a, None)
+
+    # ── Motor WTA (custom for POSITION / ACTION / DONE) ───────────
+
+    def _get_mbon_readout_indices(self):
+        """Build or return cached L3->MEMORY edge indices per group.
+
+        Returns list of (src_indices, weight_slice_indices) per group,
+        where indices refer into the full edge arrays ([:ne]).
+        Rebuilt when edges change (synaptogenesis/pruning).
+        """
+        if self._mbon_readout_cache is not None:
+            return self._mbon_readout_cache
+
+        ne = self.net._edge_count
+        src = self.net._edge_src[:ne]
+        dst = self.net._edge_dst[:ne]
+
+        _reg = list(Region)
+        abstract_r = _reg.index(Region.ABSTRACT)
+        memory_r = _reg.index(Region.MEMORY)
+
+        is_l3_to_mem = ((self.net.regions[src] == abstract_r) &
+                        (self.net.regions[dst] == memory_r))
+        l3m_indices = np.where(is_l3_to_mem)[0]
+
+        group_edge_indices = []
+        for k in range(self._n_memory_groups):
+            gmask = self._memory_group_ids == k
+            group_global = set(self._memory_idx[gmask].tolist())
+            mask = np.array([dst[i] in group_global for i in l3m_indices],
+                            dtype=np.bool_)
+            group_edge_indices.append(l3m_indices[mask])
+
+        self._mbon_readout_cache = group_edge_indices
+        return group_edge_indices
+
+    def _motor_wta(self):
+        """Apply WTA to POSITION, ACTION, and DONE pools separately."""
+        r = self.net.r
+
+        # POSITION WTA: suppress all but winner, respecting refractory
+        if len(self._position_idx) > 0:
+            pos_r = r[self._position_idx].copy()
+            for i in range(self._n_position):
+                if self._pos_refractory[i] > 0:
+                    pos_r[i] = 0.0
+            winner = int(np.argmax(pos_r))
+            for i, idx in enumerate(self._position_idx):
+                if i != winner:
+                    r[idx] *= 0.001
+
+        # Spatial attention: proportional gain modulation on KCs for the
+        # POSITION winner's cell. KCs with more inputs from the attended cell
+        # get a stronger boost. Full grid context preserved (unconnected KCs = 1x).
+        if len(self._position_idx) > 0 and self.ATTENTION_GAIN > 1.0:
+            pos_w = int(np.argmax(pos_r))
+            fractions = self._attended_kc_gains.get(pos_w)
+            if fractions is not None:
+                gains = 1.0 + fractions * (self.ATTENTION_GAIN - 1.0)
+                r[self._l3_idx] *= gains
+
+        # Direct MBON readout: compute KC->MBON weighted sum for each color
+        # group, then subtract the cross-group mean before injecting into
+        # ACTION. This models lateral inhibition between MBONs — removes
+        # common-mode input (wiring density bias) while preserving the
+        # relative differential created by depression-based learning.
+        if self._n_memory_groups > 0 and len(self._action_idx) > 0:
+            group_edges = self._get_mbon_readout_indices()
+            ne = self.net._edge_count
+            src = self.net._edge_src[:ne]
+            w = self.net._edge_w[:ne]
+            group_size = getattr(self.net, '_memory_group_size', 10) or 10
+
+            n_groups = min(self._n_memory_groups, self._n_action)
+            raw_drives = np.zeros(n_groups)
+            for k in range(n_groups):
+                eidx = group_edges[k]
+                if len(eidx) == 0:
+                    continue
+                kc_rates = r[src[eidx]]
+                raw_drives[k] = float(np.sum(kc_rates * w[eidx])) / group_size
+
+            mean_drive = float(np.mean(raw_drives))
+            for k in range(n_groups):
+                r[self._action_idx[k]] += (raw_drives[k] - mean_drive) * self.MBON_STRENGTH
+
+        # ACTION WTA: observed-color gated noisy competition
+        if len(self._action_idx) > 0:
+            act_r = r[self._action_idx].copy()
+            np.maximum(act_r, 0, out=act_r)
+
+            # Observed-color gating: zero out colors not seen in the test input.
+            # Narrows the WTA from 10 candidates to ~2-3 plausible ones, making
+            # depression-based elimination tractable.
+            for k in range(min(NUM_COLORS, self._n_action)):
+                if not self._observed_colors[k]:
+                    act_r[k] = 0.0
+
+            # Lose-shift: suppress recently punished action group
+            if self._suppress_countdown > 0 and 0 <= self._suppress_group < self._n_action:
+                act_r[self._suppress_group] *= (1.0 - self.SUPPRESS_STRENGTH)
+                self._suppress_countdown -= 1
+
+            noise = self.rng.normal(0, 1, size=self._n_action)
+            act_r_noisy = act_r + noise * (act_r * self.ACTION_NOISE_COEFF
+                                           + self.ACTION_EXPLORE_NOISE)
+            np.maximum(act_r_noisy, 0, out=act_r_noisy)
+
+            # Re-enforce gating after noise (noise can't resurrect unseen colors)
+            for k in range(min(NUM_COLORS, self._n_action)):
+                if not self._observed_colors[k]:
+                    act_r_noisy[k] = 0.0
+
+            winner = int(np.argmax(act_r_noisy))
+            for i, idx in enumerate(self._action_idx):
+                if i != winner:
+                    r[idx] *= 0.001
+            # Tonic motor drive: the noisy WTA value becomes the winner's rate.
+            # Without this, ACTION neurons with no afferent input stay at 0
+            # and can never pass the commit gate's min_act_rate threshold.
+            r[self._action_idx[winner]] = max(
+                float(r[self._action_idx[winner]]),
+                float(act_r_noisy[winner]),
+            )
+
+        # DONE: no WTA (single neuron), but apply noise boost
+        if len(self._done_idx) > 0:
+            r[self._done_idx[0]] += self.rng.normal(0, self.DONE_NOISE_BOOST)
+            if r[self._done_idx[0]] < 0:
+                r[self._done_idx[0]] = 0.0
+
+        # COMMIT: spontaneous noise bootstraps go/no-go learning
+        if len(self._commit_idx) > 0:
+            r[self._commit_idx[0]] += self.rng.normal(0, self.COMMIT_NOISE)
+            if r[self._commit_idx[0]] < 0:
+                r[self._commit_idx[0]] = 0.0
+
+    def _read_motor_winners(self) -> tuple[int, int, bool]:
+        """Read current POSITION winner, ACTION winner, and DONE state."""
+        r = self.net.r
+
+        pos_r = r[self._position_idx].copy()
+        for i in range(self._n_position):
+            if self._pos_refractory[i] > 0:
+                pos_r[i] = 0.0
+        pos_winner = int(np.argmax(pos_r))
+
+        act_winner = int(np.argmax(r[self._action_idx]))
+
+        done_fired = False
+        if len(self._done_idx) > 0:
+            done_fired = float(r[self._done_idx[0]]) > 0.3
+
+        return pos_winner, act_winner, done_fired
+
+    # ── Commit logic ──────────────────────────────────────────────
+
+    def _check_commit(self) -> tuple[bool, int, int]:
+        """Probabilistic commit gate driven by COMMIT neuron.
+
+        The COMMIT neuron's firing rate is converted to a commit probability:
+        P(commit) = clamp(rate * COMMIT_GAIN, 0, 1). The brain samples this
+        probability each iteration — higher confidence = more frequent commits.
+
+        Returns (should_commit, pos_winner, act_winner).
+        """
+        pos_w, act_w, done = self._read_motor_winners()
+
+        self._pos_winner_history.append(pos_w)
+        self._act_winner_history.append(act_w)
+
+        max_hist = 5
+        if len(self._pos_winner_history) > max_hist:
+            self._pos_winner_history = self._pos_winner_history[-max_hist:]
+            self._act_winner_history = self._act_winner_history[-max_hist:]
+
+        if done and self._total_commits >= self.MIN_COMMITS_BEFORE_DONE:
+            self._done_fired = True
+            return False, pos_w, act_w
+
+        act_rate = float(self.net.r[self._action_idx[act_w]])
+        if act_rate < self.genome.min_act_rate:
+            return False, pos_w, act_w
+
+        # Probabilistic commit gate: COMMIT rate → commit probability
+        commit_rate = 0.0
+        if len(self._commit_idx) > 0:
+            commit_rate = float(self.net.r[self._commit_idx[0]])
+
+        p_commit = min(1.0, max(0.0, commit_rate * self.COMMIT_GAIN))
+        if self.rng.random() >= p_commit:
+            return False, pos_w, act_w
+
+        return True, pos_w, act_w
+
+    def _snapshot_mbon_drives(self, pos_winner: int) -> dict:
+        """Capture current MBON readout drives for logging.
+
+        Reports baseline-subtracted values matching what _motor_wta injects.
+        """
+        r = self.net.r
+        n_groups = min(self._n_memory_groups, self._n_action)
+
+        if n_groups > 0 and len(self._action_idx) > 0:
+            group_edges = self._get_mbon_readout_indices()
+            ne = self.net._edge_count
+            src = self.net._edge_src[:ne]
+            w = self.net._edge_w[:ne]
+            gs = getattr(self.net, '_memory_group_size', 10) or 10
+
+            raw = np.zeros(n_groups)
+            for k in range(n_groups):
+                eidx = group_edges[k]
+                if len(eidx) == 0:
+                    continue
+                kc_rates = r[src[eidx]]
+                raw[k] = float(np.sum(kc_rates * w[eidx])) / gs
+            mean_d = float(np.mean(raw))
+            mbon_drives = [round((raw[k] - mean_d) * self.MBON_STRENGTH, 6)
+                           for k in range(n_groups)]
+        else:
+            mbon_drives = [0.0] * n_groups
+
+        return {
+            "mbon_drives": mbon_drives,
+            "observed_colors": self._observed_colors.tolist(),
+        }
+
+    def get_mbon_weight_summary(self) -> list[float]:
+        """Return mean L3->MEMORY weight per color group (10 floats).
+
+        Used for logging weight trajectories across tasks.
+        """
+        if self._n_memory_groups == 0:
+            return []
+
+        ne = self.net._edge_count
+        src = self.net._edge_src[:ne]
+        dst = self.net._edge_dst[:ne]
+        w = self.net._edge_w[:ne]
+
+        _reg = list(Region)
+        abstract_r = _reg.index(Region.ABSTRACT)
+        memory_r = _reg.index(Region.MEMORY)
+        is_l3m = ((self.net.regions[src] == abstract_r) &
+                  (self.net.regions[dst] == memory_r))
+
+        result = []
+        for k in range(self._n_memory_groups):
+            gmask = self._memory_group_ids == k
+            gids = set(self._memory_idx[gmask].tolist())
+            emask = is_l3m & np.array([d in gids for d in dst[:ne]],
+                                       dtype=np.bool_)
+            ws = w[emask]
+            result.append(round(float(ws.mean()), 6) if len(ws) > 0 else 0.0)
+        return result
+
+    def _update_commit_weights(self, da: float):
+        """Direct DA-modulated weight update for COMMIT neuron edges.
+
+        Striatal D1/D2 receptor analog: DA > 0 potentiates active inputs
+        to COMMIT (D1 direct pathway reinforces "go"), DA < 0 depresses
+        them (D2 indirect pathway punishes premature "go").
+
+        Only modifies edges where the source neuron was recently active,
+        keeping the update Hebbian-compatible.
+        """
+        if len(self._commit_idx) == 0:
+            return
+
+        ne = self.net._edge_count
+        dst = self.net._edge_dst[:ne]
+        src = self.net._edge_src[:ne]
+
+        commit_node = int(self._commit_idx[0])
+        commit_edges = np.where(dst == commit_node)[0]
+        if len(commit_edges) == 0:
+            return
+
+        # Only modify edges from active sources (Hebbian gating)
+        src_rates = self.net.r[src[commit_edges]]
+        active_mask = src_rates > 0.01
+        if not active_mask.any():
+            return
+
+        active_edges = commit_edges[active_mask]
+        dw = da * self.COMMIT_LR * src_rates[active_mask]
+
+        w = self.net._edge_w
+        w[active_edges] = np.clip(
+            w[active_edges] + dw,
+            0.001,  # floor: don't zero out edges completely
+            self.genome.w_max,
+        )
+
+    def on_motor_commit(self, pos_winner: int, act_winner: int,
+                        expected_grid: np.ndarray | None) -> dict:
+        """Execute a commit: write to canvas, deliver per-action reward.
+
+        Depression-based learning: wrong commits depress L3->MEMORY for
+        the wrong color's MBON group. Correct commits potentiate the
+        correct color's group.
+
+        Returns a detail dict with commit diagnostics.
+        """
+        old_color = int(self._canvas[pos_winner])
+        snapshot = self._snapshot_mbon_drives(pos_winner)
+
+        commit_rate = 0.0
+        if len(self._commit_idx) > 0:
+            commit_rate = float(self.net.r[self._commit_idx[0]])
+
+        detail = {
+            "pos": pos_winner,
+            "act": act_winner,
+            "old_color": old_color,
+            "expected": -1,
+            "correct": False,
+            "rule": "none",
+            "mean_dw": 0.0,
+            "commit_rate": round(commit_rate, 4),
+            **snapshot,
+        }
+
+        if act_winner < NUM_COLORS:
+            self._canvas[pos_winner] = act_winner
+
+        self._total_commits += 1
+        self._steps_since_commit = 0
+
+        self._pos_refractory[pos_winner] = self.REFRACTORY_STEPS
+        self._gaze_reflex_countdown = self.GAZE_REFLEX_STEPS
+
+        self._pos_winner_history.clear()
+        self._act_winner_history.clear()
+
+        if expected_grid is None:
+            return detail
+
+        flat_expected = expected_grid.ravel()
+        cell_idx = pos_winner
+
+        if cell_idx >= len(flat_expected):
+            return detail
+
+        expected_color = int(flat_expected[cell_idx])
+        new_color = int(self._canvas[cell_idx])
+        detail["expected"] = expected_color
+
+        first_commit = not self._committed[pos_winner]
+        self._committed[pos_winner] = True
+
+        if act_winner >= NUM_COLORS:
+            return detail
+
+        # Re-commits: update COMMIT neuron DA but skip MBON learning
+        # to prevent weight corruption from redundant corrections.
+        if not first_commit:
+            is_correct = (new_color == expected_color)
+            self._update_commit_weights(da=+1.0 if is_correct else -1.0)
+            detail["correct"] = is_correct
+            detail["rule"] = "recommit"
+            return detail
+
+        if new_color == expected_color:
+            detail["correct"] = True
+            correct_color = act_winner
+
+            # No potentiation — the insect MB learns primarily through
+            # depression of wrong-color groups. Correct colors win by
+            # elimination (they stay undepressed). Potentiation caused
+            # runaway weight growth on frequent colors (esp. color 0).
+            mean_change = 0.0
+            detail["rule"] = "correct_no_change"
+
+            detail["mean_dw"] = round(float(mean_change), 6)
+
+            da_per_node = np.zeros(self.net.n_nodes, dtype=np.float64)
+            da_per_node[self._position_idx[pos_winner]] = self.genome.da_correct_commit
+            sp = self.stage_manager.current_setpoints()
+            eligibility_modulated_update_percell(
+                self.net, da_per_node,
+                eta=self.genome.elig_eta * sp.plasticity_rate,
+                w_max=self.genome.w_max,
+            )
+
+            self._update_commit_weights(da=+1.0)
+
+            self.set_da(self.genome.da_global_correct)
+            return detail
+
+        # Wrong commit
+        wrong_color = act_winner
+        if wrong_color >= self._n_memory_groups:
+            return detail
+
+        wrong_group_mask = np.zeros(self.net.n_nodes, dtype=np.bool_)
+        for i, gid in enumerate(self._memory_group_ids):
+            if gid == wrong_color:
+                wrong_group_mask[self._memory_idx[i]] = True
+
+        mean_change = depression_update_l3_memory(
+            self.net,
+            wrong_group_mask=wrong_group_mask,
+            eta=self.genome.depression_eta,
+            w_floor=self.genome.depression_floor,
+        )
+
+        detail["rule"] = "depression"
+        detail["mean_dw"] = round(float(mean_change), 6)
+
+        # Lose-shift: suppress the just-punished group so WTA explores
+        self._suppress_group = wrong_color
+        self._suppress_countdown = self.SUPPRESS_STEPS
+
+        # Direct COMMIT punishment: D2 pathway depression
+        self._update_commit_weights(da=-1.0)
+
+        if old_color == expected_color:
+            da_per_node = np.zeros(self.net.n_nodes, dtype=np.float64)
+            da_per_node[self._position_idx[pos_winner]] = self.genome.da_wrong_commit
+            sp = self.stage_manager.current_setpoints()
+            eligibility_modulated_update_percell(
+                self.net, da_per_node,
+                eta=self.genome.elig_eta * sp.plasticity_rate,
+                w_max=self.genome.w_max,
+            )
+
+        self.set_da(self.genome.da_global_wrong)
+
+        return detail
+
+    # ── Deterministic motor commit ─────────────────────────────────
+
+    def commit_at_position(self, pos: int, expected_grid: np.ndarray | None,
+                           n_settle_steps: int = 5) -> dict:
+        """Visit a specific position, pick a color, and commit.
+
+        Deterministic position cycling — the teacher tells the brain WHERE
+        to look; the brain decides WHAT color to paint. Analogous to a bee
+        visiting each flower in a patch: the environment determines the
+        route, learning determines the behavior at each stop.
+
+        1. Amplify sensory signal at the attended cell, re-inject, settle
+        2. Read L3 rates (now position-specific due to amplified drive)
+        3. Compute MBON readout (with lateral inhibition)
+        4. Add instinctive copy bias from sensory input at this position
+        5. Gate by observed colors, apply lose-shift suppression
+        6. Add noise, argmax -> chosen color
+        7. Write to canvas, call on_motor_commit for reward/depression
+
+        Returns the commit detail dict from on_motor_commit.
+        """
+        r = self.net.r
+
+        # 1. Attentional spotlight with KC reset.
+        #
+        # Biology: KCs respond to the CURRENT stimulus, not accumulated
+        # past.  When an insect shifts fixation, the KC population resets
+        # and forms a fresh sparse pattern from the new input.
+        #
+        # We clear L3 state (V, r, f, adaptation) so the commit settling
+        # starts from a clean slate, then apply center-surround modulation:
+        # attended cell at full gain, surround suppressed to 10%.
+        signal = getattr(self, '_current_signal', None)
+        if signal is not None:
+            n_sensory = len(self.net.input_nodes)
+            SURROUND_SUPPRESSION = 0.1
+
+            # Reset L3 for fresh position-specific pattern
+            self.net.V[self._l3_idx] = 0.0
+            self.net.r[self._l3_idx] = 0.0
+            self.net.f[self._l3_idx] = 0.0
+            self.net.adaptation[self._l3_idx] = 0.0
+
+            # Center-surround signal: suppress surround, amplify target
+            pos_signal = signal.copy()
+            pos_signal[:n_sensory] *= SURROUND_SUPPRESSION
+            cell_base = pos * FEATURES_PER_CELL
+            cell_end = cell_base + FEATURES_PER_CELL
+            if cell_end <= n_sensory:
+                pos_signal[cell_base:cell_end] = signal[cell_base:cell_end] * self.ATTENTION_GAIN
+            self._current_signal = pos_signal
+            self.step(n_steps=n_settle_steps, learn=True)
+            self._current_signal = signal
+        else:
+            self.step(n_steps=n_settle_steps, learn=True)
+
+        # 3. MBON readout with lateral inhibition
+        n_groups = min(self._n_memory_groups, self._n_action)
+        raw_drives = np.zeros(n_groups)
+
+        if self._n_memory_groups > 0 and len(self._action_idx) > 0:
+            group_edges = self._get_mbon_readout_indices()
+            ne = self.net._edge_count
+            src = self.net._edge_src[:ne]
+            w = self.net._edge_w[:ne]
+            group_size = getattr(self.net, '_memory_group_size', 10) or 10
+
+            for k in range(n_groups):
+                eidx = group_edges[k]
+                if len(eidx) == 0:
+                    continue
+                kc_rates = r[src[eidx]]
+                raw_drives[k] = float(np.sum(kc_rates * w[eidx])) / group_size
+
+        mean_drive = float(np.mean(raw_drives)) if n_groups > 0 else 0.0
+        color_drives = np.zeros(NUM_COLORS)
+        for k in range(n_groups):
+            color_drives[k] = (raw_drives[k] - mean_drive) * self.MBON_STRENGTH
+
+        # 4. Instinctive copy bias: read the sensory input color at this position
+        signal = getattr(self, '_current_signal', None)
+        if signal is not None and self.COPY_BIAS > 0:
+            cell_base = pos * FEATURES_PER_CELL
+            cell_end = cell_base + FEATURES_PER_CELL
+            n_sensory = len(self.net.input_nodes)
+            if cell_end <= n_sensory:
+                cell_signal = signal[cell_base:cell_end]
+                input_color = int(np.argmax(cell_signal))
+                if cell_signal[input_color] > 0.5:
+                    color_drives[input_color] += self.COPY_BIAS
+
+        # 5. Observed-color gating
+        for k in range(NUM_COLORS):
+            if not self._observed_colors[k]:
+                color_drives[k] = -999.0
+
+        # Lose-shift suppression
+        if self._suppress_countdown > 0 and 0 <= self._suppress_group < NUM_COLORS:
+            color_drives[self._suppress_group] *= (1.0 - self.SUPPRESS_STRENGTH)
+            self._suppress_countdown -= 1
+
+        # 6. Add noise and pick winner
+        noise = self.rng.normal(0, 1, size=NUM_COLORS)
+        noisy_drives = color_drives + noise * (
+            np.maximum(color_drives, 0) * self.ACTION_NOISE_COEFF
+            + self.ACTION_EXPLORE_NOISE
+        )
+        # Re-enforce gating after noise
+        for k in range(NUM_COLORS):
+            if not self._observed_colors[k]:
+                noisy_drives[k] = -999.0
+
+        chosen_color = int(np.argmax(noisy_drives))
+
+        # 7. Commit: write to canvas and trigger reward/depression
+        detail = self.on_motor_commit(pos, chosen_color, expected_grid)
+        return detail
+
+    # ── Core dynamics step ────────────────────────────────────────
+
     def step(self, n_steps: int = 10, learn: bool = True,
              clamp_sensory: bool = False):
-        """
-        Run the brain for n_steps continuous ticks.
-
-        Dynamics, eligibility traces, and continuous Hebbian+DA plasticity
-        all happen inside the kernel. DA decays each call. Homeostasis
-        runs after the kernel on its own schedule.
-
-        When learn=False, network dynamics run normally (activation
-        propagation, WTA) but no weight updates occur. Used during
-        motor feedback phases — analogous to corollary discharge
-        suppressing sensory plasticity during self-generated actions.
-
-        When clamp_sensory=True, runs single-step kernel calls with
-        sensory color channels re-clamped to signal values after each
-        step. Prevents L1→sensory feedback from corrupting bottom-up
-        color perception. Only used during task attempts where motor
-        accuracy matters — NOT during infancy/mimicry where L1→sensory
-        feedback is part of the learning process.
-        """
+        """Run the brain for n_steps continuous ticks."""
         n = self.net.n_nodes
         ne = self.net._edge_count
 
@@ -454,50 +1040,14 @@ class Brain:
         else:
             edge_plastic = np.zeros(ne, dtype=np.bool_)
 
-        # Update stage manager and sync setpoints
         self.stage_manager.step(n_steps)
         sp = self.stage_manager.current_setpoints()
-
-        # Mushroom body: freeze PN->KC (input to L3) plasticity after infancy.
-        # Mushroom body (L3/KC) input edges are NEVER plastic.
-        # The sparse random wiring IS the representation — pattern separation
-        # comes from the randomness of connectivity, not from learning.
-        # Learning happens at KC->MBON (L3->MOTOR) via DA-gated eligibility.
-        if learn:
-            into_l3 = self._get_edge_into_l3(ne)
-            if into_l3.any():
-                if edge_plastic is self._edge_plastic_cache:
-                    edge_plastic = edge_plastic.copy()
-                edge_plastic[into_l3] = False
         self.homeostasis.setpoints = sp
 
-        # L1 critical period depends on stage — invalidate during transitions
-        if self.stage_manager.is_transitioning:
-            self._edge_plastic_cache = None
-            self._edge_l1_to_l2_cache = None
-            self._edge_into_l3_cache = None
-
-        # Sync developmental parameters from genetic clock
         self.neuromod.da_baseline = sp.da_baseline
         self._novelty_sensitivity = sp.da_sensitivity
         self.fatigue.threshold = sp.fatigue_threshold
 
-        # DA-gated memory write (O'Reilly & Frank 2006): scale external→memory
-        # edge weights by DA so demos (high DA) encode while attempt/rest
-        # (low DA) lets the attractor maintain its state.
-        gate_threshold = 0.15
-        gate_min = 0.15
-        mem_gate_mask = self._get_memory_gate_mask(ne)
-        da_gate = min(1.0, self.neuromod.da / gate_threshold)
-        effective_gate = gate_min + da_gate * (1.0 - gate_min)
-        saved_mem_w = None
-        if mem_gate_mask.any() and effective_gate < 0.99:
-            saved_mem_w = self.net._edge_w[:ne][mem_gate_mask].copy()
-            self.net._edge_w[:ne][mem_gate_mask] *= effective_gate
-            self.net._csr_dirty = True
-
-        # Build CSR once per step() for the parallel matmul path.
-        # get_weight_matrix() caches and only rebuilds when edges change.
         W_csr = self.net.get_weight_matrix()
         csr_indptr = W_csr.indptr
         csr_indices = W_csr.indices
@@ -520,6 +1070,8 @@ class Brain:
             self._n_cols, sp.wta_active_frac,
             np.concatenate([self._memory_idx, self._gate_idx]),
             max(1, (len(self._memory_idx) + len(self._gate_idx)) // 3),
+            self._l3_pool_indices,
+            self._l3_wta_k,
         )
 
         _tail_args = (
@@ -535,88 +1087,59 @@ class Brain:
             csr_indptr, csr_indices, csr_data,
         )
 
-        # Temporal trace rule for L1->L2 invariance learning.
-        # Active from late_infancy onward (L1 must be stable first).
-        stage = self.stage_manager.current_stage
-        _use_trace = stage not in ("infancy",)
         _trace_kwargs = dict(
             r_trace=self.net.r_trace,
             trace_decay=self.genome.trace_decay,
-            edge_is_l1_to_l2=self._get_edge_l1_to_l2(ne),
-            use_trace_rule=_use_trace,
-            trace_contrast_eta=self.genome.trace_contrast_eta,
+            edge_is_l1_to_l2=np.zeros(ne, dtype=np.bool_),
+            use_trace_rule=False,
+            trace_contrast_eta=0.0,
         )
 
         if clamp_sensory and has_signal:
-            from ..perception.encoder import FEATURES_PER_CELL as _FPC
             n_sensory = len(self.net.input_nodes)
-            n_cells = self.net.max_h * self.net.max_w
-            color_idx = np.concatenate([
-                np.arange(c * _FPC, c * _FPC + NUM_COLORS)
-                for c in range(n_cells)
-                if c * _FPC + NUM_COLORS <= n_sensory
-            ])
-            color_vals = signal[color_idx]
-
+            sensory_vals = signal[:n_sensory]
             for s_i in range(n_steps):
                 run_steps_plastic(
                     *_kernel_args, True, n, 1, noise[s_i:s_i+1],
                     *_tail_args, **_trace_kwargs,
                 )
-                self.net.V[color_idx] = color_vals
-                self.net.r[color_idx] = color_vals
+                self.net.V[:n_sensory] = sensory_vals
+                self.net.r[:n_sensory] = sensory_vals
         else:
             run_steps_plastic(
                 *_kernel_args, has_signal, n, n_steps, noise,
                 *_tail_args, **_trace_kwargs,
             )
 
-        # APL feedback: mushroom body global inhibition for L3/Kenyon cells.
-        # Only keep the top-k active KCs where k = target_sparseness * n_l3.
-        # This mimics the biological APL: a single inhibitory neuron driven
-        # by total KC activity that suppresses all but the most active KCs.
-        if len(self._l3_idx) > 0:
-            l3_r = self.net.r[self._l3_idx]
-            k = max(1, int(self.genome.apl_target_sparseness * len(self._l3_idx)))
-            n_active = int((l3_r > 0.01).sum())
-            if n_active > k:
-                thresh = np.partition(l3_r, -k)[-k]
-                suppress = l3_r < thresh
-                self.net.r[self._l3_idx[suppress]] *= 0.001
+        # Custom motor WTA (POSITION/ACTION/DONE separate pools)
+        self._motor_wta()
 
-        # Gaze WTA: strict 1-winner among gaze neurons (oculomotor selection).
-        # Applied post-kernel so gaze reflects the final rates of each step
-        # block. With only 8 neurons this is negligible overhead.
+        # Tick down refractory counters
+        active_refrac = self._pos_refractory > 0
+        self._pos_refractory[active_refrac] -= n_steps
+        np.clip(self._pos_refractory, 0, None, out=self._pos_refractory)
+
+        # Gaze WTA
         if len(self._gaze_idx) > 0:
             gaze_r = self.net.r[self._gaze_idx] + self._gaze_bias
+
+            # Post-commit gaze reflex: bias toward canvas (last slot)
+            if self._gaze_reflex_countdown > 0:
+                canvas_slot = len(self._gaze_idx) - 1
+                if canvas_slot >= 0:
+                    gaze_r[canvas_slot] += 1.0
+                self._gaze_reflex_countdown -= n_steps
+                if self._gaze_reflex_countdown < 0:
+                    self._gaze_reflex_countdown = 0
+
             winner = int(np.argmax(gaze_r))
             for gi, idx in enumerate(self._gaze_idx):
                 if gi != winner:
                     self.net.r[idx] *= 0.001
 
-        # Restore DA-gated memory weights after kernel.
-        if saved_mem_w is not None:
-            self.net._edge_w[:ne][mem_gate_mask] = saved_mem_w
-            self.net._csr_dirty = True
-
-        # Per-neuron weight normalization for competitive learning.
-        if learn and sp.plasticity_rate > 0:
-            self._normalize_incoming_weights(ne)
-            self.net._csr_dirty = True
-
-        # EMA tracking (continuous) — scaling/intrinsic deferred to sleep
         self.homeostasis.step()
 
-        # L2 excitability floor: boost quiet neurons so they can respond
-        # to novel patterns (homeostatic intrinsic plasticity, Turrigiano 2011).
-        if len(self._l2_idx) > 0:
-            l2_ema = self.homeostasis.ema_rate_dendritic[self._l2_idx]
-            quiet = l2_ema < 0.01
-            self.net.excitability[self._l2_idx[quiet]] += 0.001
-
-        # Continuous synaptogenesis — modulated by density ceiling + activity demand.
-        # Stage setpoints provide the base/max rate; actual rate scales down
-        # automatically as the network fills up and neurons become well-served.
+        # Synaptogenesis
         if sp.synaptogenesis_candidates > 0 and self.birth_edges > 0:
             growth_ratio = self.net._edge_count / self.birth_edges
             peak = self.genome.peak_growth_target
@@ -628,7 +1151,6 @@ class Brain:
             eff_rate = sp.synaptogenesis_rate * density_factor * demand_factor
             eff_cand = max(1, int(sp.synaptogenesis_candidates * density_factor))
 
-            # Birth-edge floor: boost growth when below birth count
             edge_ratio = self.net._edge_count / max(1, self.birth_edges)
             if edge_ratio < 1.0:
                 floor_boost = 1.0 + 2.0 * (1.0 - edge_ratio)
@@ -636,8 +1158,6 @@ class Brain:
                 eff_cand = int(eff_cand * floor_boost)
 
             if eff_rate > 0.001:
-                # Motor cortex matures later than sensory cortex — block
-                # new synapses targeting motor neurons until childhood.
                 stage = self.stage_manager.current_stage
                 motor_ok = stage not in ("infancy", "late_infancy")
                 layer_boost = {
@@ -655,229 +1175,58 @@ class Brain:
                     layer_demand_boost=layer_boost,
                 )
                 if self.net._edge_count != old_ne:
-                    self._edge_plastic_cache = None
-                    self._memory_gate_cache = None
-                    self._sensory_motor_cache = None
-                    self._edge_layer_cache = None
-                    self._edge_l1_to_l2_cache = None
-                    self._edge_into_l3_cache = None
+                    self._invalidate_edge_caches()
 
-        # Copy pathway maintenance. During infancy/late_infancy the instinct
-        # is re-pinned every step to prevent SHY erosion. In childhood, the
-        # copy pathway becomes plastic: consolidation drops from 20 -> 2
-        # and repinning stops, allowing CHL to refine or weaken copy weights
-        # based on task-specific reward.
-        copy_mask = self.net._edge_consolidation[:ne] >= 20.0
-        if stage in ("infancy", "late_infancy"):
-            if copy_mask.any():
-                target_w = 5.0 * sp.copy_strength
-                self.net._edge_w[:ne][copy_mask] = target_w
-                self.net._csr_dirty = True
-        elif copy_mask.any():
-            # Childhood/adolescence: release copy pathway for learning.
-            # Reduce consolidation once (20 -> 2), then never repin again.
-            self.net._edge_consolidation[:ne][copy_mask] = 2.0
-            self.net._csr_dirty = True
-            self._sensory_motor_cache = None
-
-        # DA decay toward baseline
+        # DA decay
         self.neuromod.decay()
         self.net.da = self.neuromod.da
 
-        # Fatigue accumulates proportional to both activity level and duration
+        # Fatigue
         mean_r = float(np.mean(self.net.r))
         self.fatigue.accumulate(mean_r, n_steps)
 
         self.age += n_steps
 
+    # ── Reward application ────────────────────────────────────────
+
     def apply_reward(self, DA: float) -> float:
-        """
-        Teacher calls this after observing the brain's output.
-        Cashes in eligibility traces with the given DA signal.
-        Learning rate scaled by the developmental plasticity multiplier.
-        """
+        """Global DA: cashes in eligibility traces on DONE + GAZE edges only."""
         self.set_da(DA)
+        ne = self.net._edge_count
+
+        # Scope: only DONE and GAZE destination edges
+        _reg = list(Region)
+        done_r = _reg.index(Region.DONE)
+        gaze_r = _reg.index(Region.GAZE)
+        dst_reg = self.net.regions[self.net._edge_dst[:ne]]
+        scope_mask = (dst_reg == done_r) | (dst_reg == gaze_r)
+
+        if not scope_mask.any():
+            return 0.0
+
+        # Build per-node DA: only DONE and GAZE neurons get DA
+        da_per_node = np.zeros(self.net.n_nodes, dtype=np.float64)
+        for idx in self._done_idx:
+            da_per_node[idx] = DA
+        for idx in self._gaze_idx:
+            da_per_node[idx] = DA
+
         sp = self.stage_manager.current_setpoints()
-        return eligibility_modulated_update(
-            self.net, DA=DA,
+        return eligibility_modulated_update_percell(
+            self.net, da_per_node,
             eta=self.genome.elig_eta * sp.plasticity_rate,
             w_max=self.genome.w_max,
         )
 
-    def apply_cell_reward(self, cell_rewards: np.ndarray) -> float:
-        """
-        Per-cell motor reward — topographic DA analog.
-
-        cell_rewards: array of shape (n_motor_cells,) where positive = correct,
-        negative = wrong. Each cell's NUM_COLORS motor neurons receive the
-        same DA value. Non-motor nodes get zero DA.
-
-        Uses 1/10th the kernel's learning rate. The kernel's Hebbian+DA
-        plasticity runs continuously at low effective DA and is balanced
-        by homeostasis. This per-cell reward is a concentrated pulse —
-        full eta would let a single trial make random internal->motor
-        edges as strong as the copy pathway.
-        """
-        da_per_node = np.zeros(self.net.n_nodes, dtype=np.float64)
-        n_cells = min(len(cell_rewards), self._n_motor_cells)
-        for c in range(n_cells):
-            start = self._motor_start + c * NUM_COLORS
-            da_per_node[start:start + NUM_COLORS] = cell_rewards[c]
-        sp = self.stage_manager.current_setpoints()
-        reward_eta = self.genome.elig_eta * sp.plasticity_rate * 0.01
-        return eligibility_modulated_update_percell(
-            self.net, da_per_node,
-            eta=reward_eta,
-            w_max=self.genome.w_max,
-        )
-
-    def _get_sensory_motor_mask(self, ne: int) -> np.ndarray:
-        """Cached mask: learnable 1:1 copy-topology edges only.
-
-        Selects sensory→motor edges where the source is a color channel
-        (not a spatial/boundary feature) mapping to the SAME cell and
-        SAME color in motor. Excludes the consolidated copy pathway
-        (re-pinned) and diffuse random sensory→motor edges.
-        """
-        cached = getattr(self, '_sensory_motor_cache', None)
-        if cached is not None and len(cached) == ne:
-            return cached
-
-        from ..perception.encoder import FEATURES_PER_CELL
-
-        regions = self.net.regions
-        src = self.net._edge_src[:ne]
-        dst = self.net._edge_dst[:ne]
-
-        is_sensory_motor = (
-            (regions[src] == self._sensory_reg)
-            & (regions[dst] == self._motor_reg)
-        )
-        # Exclude consolidated copy pathway
-        copy = self.net._edge_consolidation[:ne] >= 20.0
-        is_sensory_motor = is_sensory_motor & ~copy
-
-        mask = np.zeros(ne, dtype=np.bool_)
-        sm_idx = np.where(is_sensory_motor)[0]
-        if len(sm_idx) > 0:
-            s = src[sm_idx]
-            d = dst[sm_idx]
-            src_cell = s // FEATURES_PER_CELL
-            src_feat = s % FEATURES_PER_CELL
-            dst_cell = (d - self._motor_start) // NUM_COLORS
-            dst_color = (d - self._motor_start) % NUM_COLORS
-            # 1:1 topology: same cell, feature IS the matching color
-            topo_match = (src_cell == dst_cell) & (src_feat < NUM_COLORS) & (src_feat == dst_color)
-            mask[sm_idx[topo_match]] = True
-
-        self._sensory_motor_cache = mask
-        return mask
-
-    def apply_mimicry_reward(self, da: float = 0.05) -> float:
-        """Cash in eligibility traces ONLY on sensory→motor edges.
-
-        Called at the end of mimicry: the copy pathway produced the correct
-        output, sensory and motor nodes were co-active, so traces on the
-        correct sensory→motor edges are strong. Cashing them in teaches the
-        direct sensory→motor pathway to reproduce identity without the copy
-        pathway.
-
-        Restricted to sensory→motor to avoid the color-specificity problem
-        with L1→Motor edges (which connect to all color channels and create
-        statistical biases toward frequent colors).
-        """
-        ne = self.net._edge_count
-        if ne == 0:
-            return 0.0
-        mask = self._get_sensory_motor_mask(ne)
-        if not mask.any():
-            return 0.0
-
-        elig = self.net._edge_eligibility[:ne]
-        active = mask & (elig > 1e-6)
-        if not active.any():
-            return 0.0
-
-        sp = self.stage_manager.current_setpoints()
-        eta = self.genome.elig_eta * sp.plasticity_rate
-
-        w = self.net._edge_w[:ne]
-        dw = np.zeros(ne, dtype=np.float64)
-        dw[active] = eta * da * elig[active]
-
-        new_w = w.copy()
-        new_w[active] = np.clip(w[active] + dw[active], 1e-6, self.genome.w_max)
-
-        change = np.abs(new_w - w)
-        self.net._edge_w[:ne] = new_w
-        self.net._edge_tag[:ne] += change
-        self.net._csr_dirty = True
-
-        # Partial decay of cashed traces
-        self.net._edge_eligibility[:ne][active] *= 0.5
-
-        return float(change[active].mean()) if active.any() else 0.0
-
-    def snapshot_correlations(self, n_steps: int = 20) -> np.ndarray:
-        """
-        Run the brain for n_steps while accumulating pre*post correlations
-        on every edge. Returns the mean correlation vector (one value per edge).
-
-        Used for CHL: capture correlations during the "free" phase (brain's
-        own output) and "clamped" phase (correct answer shown), then compare.
-        """
-        ne = self.net._edge_count
-        corr = np.zeros(ne, dtype=np.float64)
-        for _ in range(n_steps):
-            self.step(n_steps=1)
-            accumulate_corr(
-                self.net.r,
-                self.net._edge_src[:ne],
-                self.net._edge_dst[:ne],
-                corr, ne,
-            )
-        corr /= max(n_steps, 1)
-        return corr
-
-    def apply_chl(self, free_corr: np.ndarray, clamped_corr: np.ndarray) -> float:
-        """
-        Apply Contrastive Hebbian Learning: adjust weights based on the
-        difference between clamped (correct) and free (brain's guess)
-        correlation patterns.
-
-        Also stores the pair for sleep replay.
-        """
-        from ..plasticity import contrastive_hebbian_update
-        sp = self.stage_manager.current_setpoints()
-        mean_change = contrastive_hebbian_update(
-            self.net, free_corr, clamped_corr,
-            eta=self.genome.chl_eta * sp.plasticity_rate,
-        )
-        self.store_replay(free_corr, clamped_corr)
-        return mean_change
-
-    def read_motor(self, h: int, w: int) -> np.ndarray:
-        """Read the brain's output: decode motor firing rates to a grid."""
-        motor_r = self.net.r[self.net.output_nodes]
-        return signal_to_grid(
-            motor_r, h, w,
-            max_h=self.net.max_h, max_w=self.net.max_w,
-        )
-
-    # ── Gaze (active vision) ─────────────────────────────────────────
+    # ── Gaze ──────────────────────────────────────────────────────
 
     def read_gaze(self) -> int:
-        """Return the currently selected gaze slot (argmax of gaze rates)."""
         if len(self._gaze_idx) == 0:
             return 0
         gaze_r = self.net.r[self._gaze_idx] + self._gaze_bias
         return int(np.argmax(gaze_r))
 
     def apply_gaze(self, display_buffer) -> int:
-        """Read gaze winner, fetch that slot's grid, inject into sensory.
-
-        Returns the selected slot index.
-        """
         slot = self.read_gaze()
         grid = display_buffer.get_slot(slot)
         signal = grid_to_signal(grid, max_h=self.net.max_h,
@@ -886,164 +1235,76 @@ class Brain:
         return slot
 
     def guide_gaze(self, slot_idx: int, strength: float = 1.0) -> None:
-        """Bias a specific gaze neuron to win WTA (teacher-guided saccade).
-
-        strength controls how strongly the teacher overrides the network's
-        own gaze preference. 1.0 = full control, 0.0 = no guidance.
-        """
         self._gaze_bias[:] = 0.0
         if 0 <= slot_idx < len(self._gaze_idx) and strength > 0:
             self._gaze_bias[slot_idx] = strength * 2.0
 
     def clear_gaze_bias(self) -> None:
-        """Remove teacher gaze guidance."""
         self._gaze_bias[:] = 0.0
 
     def step_with_gaze(self, display_buffer, gaze_logger=None,
                        n_steps: int = 10, learn: bool = True,
-                       clamp_sensory: bool = False) -> int:
-        """Step the brain and apply gaze consequence in one call.
+                       clamp_sensory: bool = False,
+                       expected_grid: np.ndarray | None = None) -> dict:
+        """Step the brain with gaze + commit detection.
 
-        Runs a normal step (motor and gaze neurons both fire and compete),
-        then reads the gaze winner and injects the corresponding display
-        buffer slot as the next sensory input. Returns the selected slot.
+        If expected_grid is provided, commits trigger per-action reward.
+        Updates the canvas in the display buffer's answer slot.
 
-        This is the standard "perceive through gaze" tick: the network's
-        oculomotor output determines what it sees on the next cycle, just
-        as biological saccades shift retinal input between fixations.
+        Returns dict with step info (slot, committed, done_fired).
         """
         self.step(n_steps=n_steps, learn=learn, clamp_sensory=clamp_sensory)
+
+        # Check for commit
+        should_commit, pos_w, act_w = self._check_commit()
+        self._steps_since_commit += n_steps
+
+        commit_detail = None
+        committed = False
+        if should_commit:
+            commit_detail = self.on_motor_commit(pos_w, act_w, expected_grid)
+            committed = True
+
+        # Update canvas in display buffer
+        canvas_grid = self.get_canvas_grid(self.net.max_h, self.net.max_w)
+        display_buffer.grids[display_buffer.answer_slot] = canvas_grid
+
+        # Apply gaze (perceive through current gaze selection)
         slot = self.apply_gaze(display_buffer)
         if gaze_logger is not None:
             stype = display_buffer.slot_types[slot]
-            motor_nodes = self.net.output_nodes
-            motor_active = float(self.net.r[motor_nodes].mean()) > 0.05
-            gaze_logger.record(self.age, slot, stype, motor_event=motor_active)
-        return slot
+            gaze_logger.record(self.age, slot, stype, motor_event=committed)
 
-    # ------------------------------------------------------------------
-    #  Motor babbling & mimicry
-    # ------------------------------------------------------------------
+        # Auto-submit if no commits for too long
+        auto_submit = (self._steps_since_commit >= self.AUTO_SUBMIT_STEPS
+                       and self._total_commits > 0)
 
-    def motor_babble(self, noise_std: float = 0.5,
-                     observe_steps: int = 20,
-                     display_buffer=None,
-                     gaze_logger=None) -> np.ndarray:
-        """Random motor exploration with gaze-routed visual feedback.
+        mean_change = commit_detail["mean_dw"] if commit_detail else 0.0
 
-        Phase A — inject noise, let motor fire. Instinct connections
-                  excite the answer gaze neuron during motor activity.
-        Phase B — discrete saccade: read gaze winner (biased toward
-                  answer by instinct), inject that slot as stable sensory,
-                  observe for the full fixation period.
-        Phase C — rest.
-        """
-        motor_nodes = self.net.output_nodes
+        return {
+            "slot": slot,
+            "committed": committed,
+            "pos_winner": pos_w,
+            "act_winner": act_w,
+            "mean_change": mean_change,
+            "commit_detail": commit_detail,
+            "done_fired": self._done_fired,
+            "auto_submit": auto_submit,
+            "total_commits": self._total_commits,
+        }
 
-        # Phase A: random motor activation
-        self.net.V[motor_nodes] += self.rng.normal(0, noise_std, len(motor_nodes))
-        self.step(n_steps=5)
-
-        motor_rates = self.net.r[motor_nodes].copy()
-        grid = self.read_motor(self.net.max_h, self.net.max_w)
-
-        # Phase B: discrete gaze selection + stable fixation
-        if display_buffer is not None:
-            display_buffer.write_answer(grid)
-            slot = self.read_gaze()
-            fixation_grid = display_buffer.get_slot(slot)
-            signal = grid_to_signal(fixation_grid, max_h=self.net.max_h,
-                                    max_w=self.net.max_w)
-            self.inject_signal(signal)
-            if gaze_logger is not None:
-                stype = display_buffer.slot_types[slot]
-                gaze_logger.record(self.age, slot, stype,
-                                   motor_event=True)
-        else:
-            signal = grid_to_signal(grid, max_h=self.net.max_h,
-                                    max_w=self.net.max_w)
-            self.inject_signal(signal)
-
-        self.step(n_steps=observe_steps, learn=False)
-
-        # Phase C: rest
-        self.clear_signal()
-        self.clear_gaze_bias()
-        self.step(n_steps=5)
-        return grid
-
-    def stimulus_with_feedback(self, signal: np.ndarray,
-                               observe_steps: int = 25,
-                               display_buffer=None,
-                               gaze_logger=None) -> np.ndarray:
-        """Mimicry: show a stimulus, let copy pathway fire, then observe
-        the motor output via a single discrete gaze saccade.
-
-        The copy pathway fires within ~3 steps. Motor is clamped so
-        the instinct edges bias gaze toward the answer canvas. After
-        mimicry reward, gaze selects a slot and sensory is held stable
-        for the fixation period.
-        """
-        motor_nodes = self.net.output_nodes
-
-        # Phase 1: Quick copy — let copy pathway fire (5 steps is enough)
-        self.inject_signal(signal)
-        self.step(n_steps=5)
-
-        motor_rates = self.net.r[motor_nodes].copy()
-        grid = self.read_motor(self.net.max_h, self.net.max_w)
-
-        # Phase 2: Clamp motor to correct output while sensory features
-        # develop. Eligibility traces accumulate from co-activation of
-        # sensory color nodes and correct motor output.
-        remaining = max(1, observe_steps - 5)
-        for _ in range(remaining):
-            self.net.r[motor_nodes] = motor_rates
-            self.step(n_steps=1)
-
-        self.apply_mimicry_reward(da=1.0)
-
-        # Phase 3: discrete gaze saccade + stable fixation.
-        # Motor is still active from Phase 2, so instinct edges bias
-        # gaze toward the answer slot. Read gaze once, fixate.
-        if display_buffer is not None:
-            display_buffer.write_answer(grid)
-            slot = self.read_gaze()
-            fixation_grid = display_buffer.get_slot(slot)
-            fb_signal = grid_to_signal(fixation_grid,
-                                       max_h=self.net.max_h,
-                                       max_w=self.net.max_w)
-            self.inject_signal(fb_signal)
-            if gaze_logger is not None:
-                stype = display_buffer.slot_types[slot]
-                gaze_logger.record(self.age, slot, stype,
-                                   motor_event=True)
-        else:
-            feedback = grid_to_signal(grid, max_h=self.net.max_h,
-                                      max_w=self.net.max_w)
-            self.inject_signal(feedback)
-
-        self.step(n_steps=observe_steps, learn=False)
-
-        self.clear_signal()
-        self.clear_gaze_bias()
-        self.step(n_steps=5)
-        return grid
+    # ── Sleep ─────────────────────────────────────────────────────
 
     def try_sleep(self) -> dict | None:
-        """Sleep if fatigued. Returns sleep stats or None."""
         if not self.fatigue.needs_sleep():
             return None
 
         sp = self.stage_manager.current_setpoints()
-
-        # Layer-aware health decay: build per-edge scale from stage setpoints
         edge_layers = self._get_edge_layer_class()
         layer_decay_scales = np.ones(self.net._edge_count, dtype=np.float64)
         layer_decay_scales[edge_layers == 1] = sp.health_decay_L2_scale
         layer_decay_scales[edge_layers == 2] = sp.health_decay_L3_scale
 
-        # Birth-edge floor: soften pruning when below birth count
         health_decay = sp.health_decay_rate
         edge_ratio = self.net._edge_count / max(1, self.birth_edges)
         if edge_ratio < 1.0:
@@ -1053,8 +1314,8 @@ class Brain:
         stats = nrem_sleep(
             self.net,
             self._replay_buffer,
-            chl_eta=self.genome.chl_eta * 0.3 * sp.plasticity_rate,
-            shy_downscale=0.97,
+            chl_eta=self.genome.chl_eta * self.genome.sleep_chl_scale * sp.plasticity_rate,
+            shy_downscale=self.genome.sleep_shy_downscale,
             health_decay_rate=health_decay,
             ema_rate=self.homeostasis.ema_rate_dendritic,
             target_rate=sp.target_rate,
@@ -1062,51 +1323,35 @@ class Brain:
             layer_decay_scales=layer_decay_scales,
         )
 
-        # Pruning may have changed edge count — invalidate caches
+        # Spontaneous recovery: depressed L3→MEMORY weights drift back
+        # toward their initial strong values (biological forgetting of
+        # specific depression, prevents permanent inflexibility).
+        recovery_l3_memory(self.net, recovery_rate=self.genome.recovery_rate)
+
         if stats.get("pruned", 0) > 0:
-            self._edge_plastic_cache = None
-            self._memory_gate_cache = None
-            self._sensory_motor_cache = None
-            self._edge_layer_cache = None
-            self._edge_l1_to_l2_cache = None
-            self._edge_into_l3_cache = None
+            self._invalidate_edge_caches()
 
-        # Homeostatic corrections run during sleep, not waking.
         self.homeostasis.sleep_correction()
-
         self.fatigue.reset()
-
         return stats
 
-    def store_replay(self, free_corr: np.ndarray, clamped_corr: np.ndarray):
-        """Store correlation pair for sleep replay, tagged with current DA level.
+    # ── Persistence ───────────────────────────────────────────────
 
-        Higher DA at storage time = more surprising experience = higher
-        replay priority during sleep (mirroring hippocampal sharp-wave
-        ripple prioritization of salient memories).
-        """
+    def store_replay(self, free_corr: np.ndarray, clamped_corr: np.ndarray):
         da_tag = float(self.neuromod.da)
         self._replay_buffer.append((free_corr.copy(), clamped_corr.copy(), da_tag))
         if len(self._replay_buffer) > self._max_replay:
             self._replay_buffer.pop(0)
 
     def store_signal(self, signal: np.ndarray):
-        """Store a sensory signal for spontaneous replay during rest."""
         self._signal_buffer.append(signal.copy())
         if len(self._signal_buffer) > self._max_replay:
             self._signal_buffer.pop(0)
 
     def spontaneous_replay(self, n_steps: int = 30, strength: float = 0.3):
-        """
-        During rest, replay a recent sensory memory at low intensity.
-        Mimics the brain's tendency to "rehearse" recent experiences
-        between tasks. Helps consolidate without explicit teaching.
-        """
         if not self._signal_buffer:
             self.step(n_steps=n_steps)
             return
-
-        # Pick a random recent memory
         idx = self.rng.integers(0, len(self._signal_buffer))
         memory = self._signal_buffer[idx] * strength
         self.inject_signal(memory)
@@ -1123,8 +1368,8 @@ class Brain:
     def birth(
         cls,
         genome: Genome,
-        grid_h: int = 5,
-        grid_w: int = 5,
+        grid_h: int = 3,
+        grid_w: int = 3,
         seed: int | None = None,
         checkpoint_dir: str = "life",
     ) -> "Brain":
@@ -1138,7 +1383,7 @@ class Brain:
 
         brain = cls(net, genome, rng=rng, checkpoint_dir=checkpoint_dir)
 
-        # Warm up EMA rates so homeostasis starts from realistic values.
+        # Warm up EMA rates
         cal_rng = np.random.default_rng(0)
         for gen in [solid_fill, checkerboard]:
             grid = gen(grid_h, grid_w, cal_rng)
@@ -1164,7 +1409,6 @@ class Brain:
         genome: Genome,
         checkpoint_dir: str = "life",
     ) -> "Brain":
-        """Resume from the latest checkpoint."""
         checkpointer = Checkpointer(checkpoint_dir=checkpoint_dir)
         ckpt = checkpointer.find_latest()
         if ckpt is None:
@@ -1178,7 +1422,6 @@ class Brain:
         checkpoint_path: str,
         checkpoint_dir: str | None = None,
     ) -> "Brain":
-        """Load from a specific checkpoint directory."""
         from pathlib import Path
         ckpt = Path(checkpoint_path)
         if not (ckpt / "network.npz").exists():
@@ -1217,3 +1460,66 @@ class Brain:
             brain.homeostasis.load_state_dict(meta["homeostasis"])
 
         return brain
+
+    # ── Decorrelation (kept for compatibility) ────────────────────
+
+    def decorrelate_layers(self, eta: float = 0.01, sim_threshold: float = 0.4):
+        total = 0
+        layer_params = [
+            (self._l1_idx, eta, sim_threshold),
+            (self._l2_idx, eta * 3.0, max(sim_threshold - 0.1, 0.15)),
+            (self._l3_idx, eta, sim_threshold),
+        ]
+        for layer_idx, layer_eta, layer_thresh in layer_params:
+            if len(layer_idx) > 0:
+                total += lateral_decorrelation(
+                    self.net, layer_idx,
+                    eta=layer_eta, sim_threshold=layer_thresh,
+                )
+        return total
+
+    def _normalize_incoming_weights(self, ne: int):
+        w = self.net._edge_w[:ne]
+        dst = self.net._edge_dst[:ne]
+        cons = self.net._edge_consolidation[:ne]
+
+        _reg = list(Region)
+        sensory_idx = _reg.index(Region.SENSORY)
+        src = self.net._edge_src[:ne]
+        src_is_sensory = self.net.regions[src] == sensory_idx
+
+        exc_mask = (w > 0) & (cons < 1.0) & src_is_sensory
+        if exc_mask.sum() == 0:
+            return
+
+        target_norm_sq = (self.genome.weight_scale * 30.0) ** 2
+        sq_sums = np.zeros(self.net.n_nodes, dtype=np.float64)
+        np.add.at(sq_sums, dst[exc_mask], w[exc_mask] ** 2)
+
+        needs_scale = sq_sums > target_norm_sq * 1.44
+        if not np.any(needs_scale):
+            return
+
+        scale_factors = np.ones(self.net.n_nodes, dtype=np.float64)
+        mask = needs_scale & (sq_sums > 1e-16)
+        scale_factors[mask] = np.sqrt(target_norm_sq / sq_sums[mask])
+
+        per_edge_scale = scale_factors[dst]
+        w[exc_mask] *= per_edge_scale[exc_mask]
+        self.net._csr_dirty = True
+
+    # ── Correlation snapshots (kept for sleep replay) ─────────────
+
+    def snapshot_correlations(self, n_steps: int = 20) -> np.ndarray:
+        ne = self.net._edge_count
+        corr = np.zeros(ne, dtype=np.float64)
+        for _ in range(n_steps):
+            self.step(n_steps=1)
+            accumulate_corr(
+                self.net.r,
+                self.net._edge_src[:ne],
+                self.net._edge_dst[:ne],
+                corr, ne,
+            )
+        corr /= max(n_steps, 1)
+        return corr

@@ -531,29 +531,39 @@ def run_infancy(
 
 def main():
     parser = argparse.ArgumentParser(description="Brain lifecycle runner")
-    parser.add_argument("--days", type=int, default=0, help="Childhood days to run (0=indefinite)")
+    parser.add_argument("--days", type=int, default=0, help="Days to run (0=indefinite)")
     parser.add_argument("--tasks-per-day", type=int, default=50)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--grid", type=int, default=10, help="Grid dimension (square)")
+    parser.add_argument("--grid", type=int, default=3, help="Grid dimension (square)")
     parser.add_argument("--checkpoint-dir", type=str, default="runs/life")
     parser.add_argument("--task-dir", type=str, default="micro_tasks")
     parser.add_argument("--fresh", action="store_true", help="Force new brain (ignore checkpoints)")
     parser.add_argument("--eval-every", type=int, default=5, help="Run eval snapshot every N days (0=never)")
     parser.add_argument("--snapshot-every", type=int, default=1, help="Log brain health snapshot every N days")
-    parser.add_argument("--infancy-days", type=int, default=20, help="Max infancy days (0=skip)")
-    parser.add_argument("--infancy-stimuli", type=int, default=60, help="Stimuli per infancy day")
-    parser.add_argument("--growth-target", type=float, default=2.5, help="Synapse growth target (multiple of birth)")
+    parser.add_argument("--genome", type=str, default=None,
+                        help="Path to a best_genome.json from an evolution run")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _handle_sigint)
-    print("Starting brain lifecycle...", flush=True)
+    print("Starting brain lifecycle (insect baseline)...", flush=True)
 
-    genome = Genome(
-        n_internal=1500,
-        n_memory=200,
-        max_h=args.grid,
-        max_w=args.grid,
-    )
+    if args.genome:
+        import json
+        with open(args.genome) as f:
+            gdata = json.load(f)
+        genome_dict = gdata["genome"] if "genome" in gdata else gdata
+        known = {f.name for f in Genome.__dataclass_fields__.values()}
+        genome_dict = {k: v for k, v in genome_dict.items() if k in known}
+        genome_dict["max_h"] = args.grid
+        genome_dict["max_w"] = args.grid
+        genome = Genome(**genome_dict)
+        print(f"Loaded genome from {args.genome} (fitness={gdata.get('fitness', '?')})",
+              flush=True)
+    else:
+        genome = Genome(
+            max_h=args.grid,
+            max_w=args.grid,
+        )
     monitor = Monitor(log_dir=args.checkpoint_dir)
 
     # Birth or resume
@@ -586,40 +596,9 @@ def main():
     # Initial brain health snapshot
     monitor.brain_snapshot(brain, label="birth")
     _birth_health_check(brain, monitor)
-    birth_edges = brain.net._edge_count
 
-    # ── INFANCY PHASE ─────────────────────────────────────────────
-    if args.infancy_days > 0 and brain.stage_manager.current_stage == "infancy":
-        arc_grids = load_arc_inputs(args.task_dir, args.grid, args.grid)
-        monitor.status(f"Loaded {len(arc_grids)} ARC input grids for infancy exposure")
-
-        stimuli = InfancyStimuli(
-            max_h=args.grid,
-            max_w=args.grid,
-            rng=brain.rng,
-            arc_input_grids=arc_grids,
-            arc_mix_ratio=0.5,
-        )
-
-        run_infancy(
-            brain=brain,
-            monitor=monitor,
-            stimuli=stimuli,
-            birth_edges=birth_edges,
-            max_days=args.infancy_days,
-            stimuli_per_day=args.infancy_stimuli,
-            growth_target=args.growth_target,
-        )
-
-        # Diagnose what infancy built
-        diagnose_infancy(brain, monitor)
-
-        # Transition to childhood
-        brain.stage_manager.transition_to("childhood")
-        monitor.status("Stage transition: infancy -> childhood")
-        monitor.brain_snapshot(brain, label="childhood_start")
-
-    # ── CHILDHOOD PHASE ───────────────────────────────────────────
+    # No infancy — insect baseline is born ready to learn.
+    # Go straight to task training.
     teacher = Teacher(
         brain=brain,
         monitor=monitor,
@@ -635,13 +614,11 @@ def main():
 
             result = teacher.run_day(max_tasks=args.tasks_per_day)
 
-            # Periodic brain health snapshot
             if args.snapshot_every > 0 and day % args.snapshot_every == 0:
-                monitor.brain_snapshot(brain, label=f"childhood_day_{day}")
+                monitor.brain_snapshot(brain, label=f"day_{day}")
 
-            # Milestone save + evaluation snapshot
             if day % 5 == 0:
-                brain.save_milestone(f"childhood_day_{day}")
+                brain.save_milestone(f"day_{day}")
 
             if args.eval_every > 0 and day % args.eval_every == 0:
                 monitor.status(f"Running eval snapshot at day {day}...")

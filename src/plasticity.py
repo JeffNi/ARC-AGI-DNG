@@ -57,7 +57,7 @@ def contrastive_hebbian_update(
     if n == 0:
         return 0.0
 
-    if abs(eta) < 1e-8:
+    if np.isscalar(eta) and abs(eta) < 1e-8:
         return 0.0
 
     fc = free_corr[:n] if len(free_corr) >= n else np.pad(free_corr, (0, n - len(free_corr)))
@@ -208,9 +208,157 @@ def eligibility_modulated_update_percell(
     net._edge_tag[:n] += change
     net._csr_dirty = True
 
-    net._edge_eligibility[:n] *= 0.5
+    # Consume eligibility on edges that received DA (trace is "spent").
+    # Edges that didn't get DA retain their traces for future reward.
+    net._edge_eligibility[:n][active] = 0.0
 
-    return float(np.mean(change[active]))
+    changed = change[active] > 1e-10
+    if changed.any():
+        return float(np.mean(change[active][changed]))
+    return 0.0
+
+
+def depression_update_l3_memory(
+    net: DNG,
+    wrong_group_mask: np.ndarray,
+    eta: float = 0.08,
+    w_floor: float = 0.01,
+) -> float:
+    """
+    DA-modulated synaptic depression at L3->MEMORY (KC->MBON).
+
+    Biology: DA triggers LTD only at synapses from currently active KCs.
+    Plasticity is local to active synapses — inactive KCs are unaffected.
+
+    For active KCs:   dw = -eta * w  (homosynaptic LTD)
+
+    wrong_group_mask: boolean array over nodes, True for MEMORY neurons
+                      in the wrong color's group.
+    """
+    n = net._edge_count
+    if n == 0:
+        return 0.0
+
+    src = net._edge_src[:n]
+    dst = net._edge_dst[:n]
+    w = net._edge_w[:n]
+
+    from .graph import Region
+    _reg = list(Region)
+    abstract_r = _reg.index(Region.ABSTRACT)
+    src_reg = net.regions[src]
+    is_l3_src = src_reg == abstract_r
+    is_wrong_dst = wrong_group_mask[dst]
+
+    target = is_l3_src & is_wrong_dst & (w > w_floor)
+    if not target.any():
+        return 0.0
+
+    r_pre = net.r[src]
+    active = r_pre > 1e-4
+
+    # Depression: rate-scaled homosynaptic LTD.
+    # dw is proportional to presynaptic rate, so attended KCs (higher rate
+    # from spatial attention gain) get more depression than unattended ones.
+    # This makes depression position-specific when combined with attention.
+    dw = np.zeros(n, dtype=np.float64)
+    active_target = target & active
+    dw[active_target] = -eta * w[active_target] * r_pre[active_target]
+
+    new_w = w + dw
+    new_w[target] = np.maximum(new_w[target], w_floor)
+
+    change = np.abs(new_w - w)
+    net._edge_w[:n] = new_w
+    net._edge_tag[:n] += change
+    net._csr_dirty = True
+
+    changed = change[target] > 1e-10
+    if changed.any():
+        return float(np.mean(change[target][changed]))
+    return 0.0
+
+
+def potentiation_update_l3_memory(
+    net: DNG,
+    correct_group_mask: np.ndarray,
+    eta: float = 0.05,
+    w_max: float = 0.5,
+) -> float:
+    """
+    Reward-driven potentiation at L3->MEMORY for the correct color group.
+
+    Biology: correct outcomes cause DA-mediated LTP at KC->MBON synapses
+    for the rewarded MBON compartment. Strengthens the pathway so the
+    correct color group stands out from other undepressed groups.
+
+    correct_group_mask: boolean array over nodes, True for MEMORY neurons
+                        in the correct color's group.
+    """
+    n = net._edge_count
+    if n == 0:
+        return 0.0
+
+    src = net._edge_src[:n]
+    dst = net._edge_dst[:n]
+    w = net._edge_w[:n]
+
+    from .graph import Region
+    _reg = list(Region)
+    abstract_r = _reg.index(Region.ABSTRACT)
+    src_reg = net.regions[src]
+    is_l3_src = src_reg == abstract_r
+    is_correct_dst = correct_group_mask[dst]
+
+    r_pre = net.r[src]
+    target = is_l3_src & is_correct_dst & (r_pre > 1e-4) & (w < w_max)
+    if not target.any():
+        return 0.0
+
+    dw = np.zeros(n, dtype=np.float64)
+    dw[target] = eta * r_pre[target]
+
+    new_w = w + dw
+    new_w[target] = np.minimum(new_w[target], w_max)
+
+    change = np.abs(new_w - w)
+    net._edge_w[:n] = new_w
+    net._edge_tag[:n] += change
+    net._csr_dirty = True
+
+    changed = change[target] > 1e-10
+    if changed.any():
+        return float(np.mean(change[target][changed]))
+    return 0.0
+
+
+def recovery_l3_memory(
+    net: DNG,
+    recovery_rate: float = 0.002,
+) -> None:
+    """
+    Spontaneous recovery: depressed L3→MEMORY weights drift back toward
+    their initial (strong) values. Called during sleep.
+
+    Biology: without ongoing reinforcement, synaptic depression fades
+    and connections return to baseline. Prevents permanent loss of flexibility.
+    """
+    if not hasattr(net, '_l3_mem_edge_slice') or not hasattr(net, '_l3_mem_initial_w'):
+        return
+
+    start, end = net._l3_mem_edge_slice
+    if end > net._edge_count:
+        return
+
+    current = net._edge_w[start:end]
+    initial = net._l3_mem_initial_w
+    # Only recover depressed weights (current < initial).
+    # Potentiated weights persist — spontaneous recovery in biology
+    # restores suppressed associations, it doesn't erase learned ones.
+    delta = recovery_rate * (initial - current)
+    depressed = current < initial
+    net._edge_w[start:end] = np.where(depressed, current + delta, current)
+    net._csr_dirty = True
 
 
 # ── Consolidation ─────────────────────────────────────────────────
@@ -437,6 +585,7 @@ def synaptogenesis(
     sensory_idx = region_list.index(Region.SENSORY)
     motor_idx = region_list.index(Region.MOTOR)
     l1_idx = region_list.index(Region.LOCAL_DETECT)
+    abstract_idx = region_list.index(Region.ABSTRACT)
 
     # Use EMA rates for stable activity signal, fall back to instantaneous
     activity = activity_ema if activity_ema is not None else net.r
@@ -463,22 +612,29 @@ def synaptogenesis(
     src_all = np.concatenate([src_active, src_explore])
     dst_all = np.concatenate([dst_active, dst_explore])
 
-    # Biological constraints:
-    #  - no self-loops
-    #  - no edges TO sensory
-    #  - no edges FROM motor
-    #  - sensory can only project to L1 (thalamocortical targeting —
-    #    axon guidance molecules restrict thalamic afferents to layer 4
-    #    of primary sensory cortex, not higher areas)
-    src_is_sensory = net.regions[src_all] == sensory_idx
-    dst_is_l1 = net.regions[dst_all] == l1_idx
+    # Autonomous mushroom body: L3 -> POSITION/ACTION/DONE/GAZE growth.
+    # Also MEMORY -> POSITION/ACTION/DONE growth.
+    gaze_idx = region_list.index(Region.GAZE)
+    memory_idx_r = region_list.index(Region.MEMORY)
+
+    # New motor regions
+    pos_idx = region_list.index(Region.POSITION) if Region.POSITION in region_list else -1
+    act_idx = region_list.index(Region.ACTION) if Region.ACTION in region_list else -1
+    done_idx = region_list.index(Region.DONE) if Region.DONE in region_list else -1
+
+    src_is_l3 = net.regions[src_all] == abstract_idx
+    src_is_mem = net.regions[src_all] == memory_idx_r
     dst_is_motor = net.regions[dst_all] == motor_idx
+    dst_is_gaze = net.regions[dst_all] == gaze_idx
+    dst_is_pos = net.regions[dst_all] == pos_idx if pos_idx >= 0 else np.zeros(len(dst_all), dtype=bool)
+    dst_is_act = net.regions[dst_all] == act_idx if act_idx >= 0 else np.zeros(len(dst_all), dtype=bool)
+    dst_is_done = net.regions[dst_all] == done_idx if done_idx >= 0 else np.zeros(len(dst_all), dtype=bool)
+    dst_is_any_motor = dst_is_motor | dst_is_pos | dst_is_act | dst_is_done
+
     valid = (
         (src_all != dst_all)
-        & (net.regions[dst_all] != sensory_idx)
-        & (net.regions[src_all] != motor_idx)
-        & (~src_is_sensory | dst_is_l1)
-        & (allow_motor_target | ~dst_is_motor)
+        & ((src_is_l3 | src_is_mem) & (dst_is_any_motor | dst_is_gaze))
+        & (allow_motor_target | ~dst_is_any_motor)
     )
     src_all = src_all[valid]
     dst_all = dst_all[valid]

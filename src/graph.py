@@ -43,6 +43,10 @@ class Region(enum.Enum):
     ABSTRACT = "abstract"
     GATE = "gate"
     GAZE = "gaze"
+    POSITION = "position"
+    ACTION = "action"
+    DONE = "done"
+    COMMIT = "commit"
 
 
 # Cortical hierarchy layers (ordered low → high)

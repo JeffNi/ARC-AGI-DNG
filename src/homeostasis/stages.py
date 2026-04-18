@@ -18,6 +18,34 @@ from .setpoints import HomeostasisSetpoints
 
 
 STAGES: dict[str, HomeostasisSetpoints] = {
+    "operational": HomeostasisSetpoints(
+        # Insect baseline: single fixed parameter set. No transitions.
+        # Born ready to learn — the mushroom body is hardwired at birth.
+        target_rate=0.15,
+        scaling_gain=0.0,
+        intrinsic_eta=0.0,
+        ei_target_ratio=0.8,
+        ema_tau=0.02,
+        synaptogenesis_rate=0.1,
+        synaptogenesis_candidates=5_000,
+        health_decay_rate=0.05,
+        da_baseline=0.05,
+        da_sensitivity=0.5,
+        plasticity_rate=1.0,
+        leak_rate_target=0.10,
+        n_demos=2,
+        spotlight_strength=1.5,
+        fatigue_threshold=15.0,
+        wta_active_frac=0.10,
+        noise_std=0.02,
+        task_mix_ratio=1.0,
+        babble_ratio=0.0,
+        copy_strength=1.0,
+        health_decay_L2_scale=1.0,
+        health_decay_L3_scale=1.0,
+        synaptogenesis_L2_boost=1.0,
+        synaptogenesis_L3_boost=1.0,
+    ),
     "infancy": HomeostasisSetpoints(
         # During infancy, stability comes from L2 weight normalization,
         # conscience mechanism, SHY downscaling, and health-based pruning.
@@ -160,7 +188,7 @@ class StageManager:
 
     def __init__(
         self,
-        initial_stage: str = "infancy",
+        initial_stage: str = "operational",
         transition_tau: int = 10_000,
     ):
         if initial_stage not in STAGES:
