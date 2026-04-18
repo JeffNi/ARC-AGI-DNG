@@ -110,3 +110,39 @@ reason at 4x4.
 - Convolutional sensory encoding (shared weights across positions)
 - Working memory for partial results
 - Compositional rule understanding (novel task types from known primitives)
+
+---
+
+## Research Questions / Future Explorations
+
+### Brain Hemispheres
+
+Biological brains (vertebrates and many invertebrates including insects) have
+bilateral symmetry — two hemispheres processing slightly different
+representations of the same input. This is NOT merely an evolutionary quirk:
+
+- **Redundancy and robustness**: damage to one hemisphere doesn't destroy all
+  learned associations
+- **Lateralized specialization**: in bees, the right antenna/left hemisphere is
+  better at learning odor associations, while the left antenna/right hemisphere
+  contributes to long-term memory consolidation
+- **Ensemble diversity**: two slightly different sparse codes for the same input
+  provide richer representational capacity and better generalization
+- **Inter-hemispheric comparison**: cross-talk between hemispheres enables
+  comparison-based computation (detecting differences, integrating perspectives)
+
+**Potential implementation:**
+- Duplicate L3 (KC population) into two hemispheres with independent random wiring
+- Each hemisphere develops its own sparse code for the same sensory input
+- MBON readout averages or combines both hemispheric representations
+- Cross-hemispheric connections (callosal analog) enable comparison circuits
+- Could be critical for Phase 3 (comparing demo input vs output patterns)
+
+**Open questions:**
+- At our scale (~800 KCs), is splitting into 2×400 worth the representational
+  cost vs keeping 1×800?
+- Should hemispheres share plasticity rules but differ in initial wiring?
+- When in development should cross-hemispheric connections form?
+
+**Priority:** Low for now. Revisit when Phase 2 generalization hits limits, or
+when Phase 3 requires comparison circuits.

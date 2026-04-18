@@ -2,7 +2,7 @@
 
 > A research project exploring whether intelligence can emerge from structure and plasticity rather than scale and gradient descent.
 
-**Status: Active research — infancy and sensory development complete, entering learning phase.**
+**Status: Active research — Phase 1 complete (trial-and-error motor learning). Entering Phase 2 (within-task generalization).**
 
 ---
 
@@ -29,99 +29,105 @@ The architecture follows the **bee brain** — the simplest biological system kn
 ## Architecture
 
 ```
-SENSORY (2828 nodes)
+SENSORY (90 neurons: 9 cells × 10 colors)
     │
     ▼
-L1 / Optic Lobe (900 neurons) ─── Feature detection, columnar WTA
-    │
+L3 / Mushroom Body (800 Kenyon Cells)
+    │   Local receptive fields (kc_local_fan per assigned cell)
+    │   + random cross-cell context (kc_global_fan)
+    │   APL global inhibition → ~10% sparseness
     ▼
-L2 / Projection Neurons (300) ─── Intermediate features, trace-rule invariance
-    │
+MEMORY / MBONs (100 neurons: 10 groups × 10 colors)
+    │   Depression-only learning (L3→MEMORY)
+    │   Readout injected into ACTION with cross-group inhibition
     ▼
-L3 / Mushroom Body (800 neurons) ─ Expansion recoding, sparse pattern separation
-    │                                 APL global inhibition → 10% sparseness
+ACTION (90 neurons: 9 cells × 10 colors)
+    │   copy_bias + MBON drive + observed-color gating
+    │   Deterministic position cycling (teacher-driven)
     ▼
-MOTOR / MBONs (1000 nodes) ─────── Output decoding, DA-gated associative learning
+Output grid (3×3)
 
-Also: MEMORY (100), GATE, GAZE, Copy pathway (SENSORY → MOTOR, decays with maturation)
+Also: GAZE (9), POSITION (9), DONE, COMMIT
 ```
 
-| Layer | Neurons | Biological Analogue | Function |
-|-------|---------|---------------------|----------|
-| L1 | 900 | Bee optic lobe / Mammalian V1 | Local feature detectors via columnar competition |
-| L2 | 300 | Projection neurons / V2-V4 | Temporal binding, modest transformation invariance |
-| L3 | 800 | Mushroom body (Kenyon cells) | Expansion recoding with sparse random connectivity (~15 inputs per neuron) |
-| MOTOR | 1000 | MBONs / Motor cortex | Per-cell output with WTA color selection |
+| Region | Neurons | Biological Analogue | Function |
+|--------|---------|---------------------|----------|
+| SENSORY | 90 | Photoreceptors | One-hot color encoding per grid cell |
+| L3 | 800 | Mushroom body (Kenyon cells) | Expansion recoding with local receptive fields |
+| MEMORY | 100 | MBONs | 10 color-specific groups; depression encodes "not this color" |
+| ACTION | 90 | Motor neurons | Per-cell color selection via WTA |
 
 **Key mechanisms:**
-- **APL inhibition** — A single global inhibitory signal (modeled on the bee's APL neuron) enforces ~10% sparseness in L3, creating high-dimensional sparse codes for pattern separation
-- **Developmental staging** — Parameters interpolate smoothly between life stages (WTA strictness, plasticity rates, inhibitory balance) rather than switching abruptly
-- **Contrastive Hebbian Learning (CHL)** — Error-driven weight updates without backpropagation. The difference between "free" and "clamped" network states provides a local error signal
-- **Sleep consolidation** — DA-tagged replay of surprising experiences, SHY-hypothesis downscaling of synaptic weights
+- **Local KC wiring** — Each Kenyon cell has an assigned grid position and samples `kc_local_fan` sensory neurons from that cell plus `kc_global_fan` random cross-cell inputs, creating position-specific sparse codes
+- **Attentional spotlight** — Center-surround gain modulation amplifies the target cell's sensory signal and suppresses surround, with L3 state reset before each commit
+- **Depression-only learning** — L3→MEMORY weights only decrease (wrong-color groups get depressed proportional to KC firing). No potentiation. Recovery during sleep drifts weights back toward baseline
+- **copy_bias** — Innate additive bias for the observed input color (identity reflex), kept low enough (0.05) that depression can override it within a few retries
+- **Observed-color gating** — Action selection restricted to colors present in the input grid
+- **Developmental staging** — Parameters interpolate smoothly between life stages rather than switching abruptly
+- **Sleep consolidation** — SHY-hypothesis downscaling; recovery_rate drifts depressed MBON weights back toward initial values
 
 ## Current Progress
 
-### Completed: Unsupervised Development (40-day lifecycle)
+### Phase 1 Complete: Trial-and-Error Motor Learning
 
-The network successfully develops stable representations through infancy and late infancy:
+The brain learns to solve simple grid transformations through repeated attempts and reward feedback — analogous to a rat learning which lever to press, or a bee learning which color leads to sugar water.
 
-**L1 (Feature Detection) — Stable**
-- ~220 alive neurons with selectivity ~0.21
-- Column switching 97-99/100 — reliably produces different activation patterns for different inputs
-- No collapse despite 40 days of continuous plasticity
+**Tasks solved (3×3 grids, 4-12 retries per instance):**
+- Identity — copy input to output
+- Solid fill — fill entire grid with a single color
+- Color swap — replace color A with color B everywhere
+- Color extract — output only cells matching a target color
 
-**L2 (Intermediate Features) — Functional**
-- Discriminates confusable patterns that L1 cannot (L2 vs L1 improvement: +0.44 on confusable pairs)
-- Driven fraction ~0.42 at maturity
+**How it works:**
+1. Brain observes input grid via SENSORY neurons
+2. For each cell position, L3 Kenyon cells fire a sparse pattern
+3. MBON readout + copy_bias produce an initial color guess (usually the input color)
+4. Wrong guesses trigger depression of the active KC→MBON connections for that color group
+5. On retry, the depressed pathway is weaker, so a different color wins
+6. Repeats until correct (or retry budget exhausted)
 
-**L3 (Mushroom Body) — Partially working**
-- Sparseness locked at exactly 10% for all 40 days (APL inhibition working)
-- Cross-category similarity (catSim) at 0.60 — pattern separation needs improvement (lower = more distinct; random baseline ~0.13). Cause identified: Hebbian plasticity during infancy eroded the random L2→L3 wiring. Next fix: freeze L3 input edges from birth.
-- 150+ unique active neurons per probe
+**Known limitations:**
+- No generalization to unseen instances — depression is instance-specific
+- Spatial transformations (flip, rotate) not solvable without learnable attention
+- Learning is purely eliminative (suppress wrong answers), not associative
 
-**Gaze System — Developing**
-- Fixation events grew from 7 (Day 5) to 37 (Day 40)
-- Motor events: 11 → 48
-- Spatial scanning emerged (adjacent transition ratio well above chance)
-- Stimulus-directed attention: 21/37 fixations on stimulus by Day 40
-
-**Infrastructure**
-- 1.2M edges at maturity (1.25x growth from 987K at birth)
-- Weights continuously sculpted (w90: 0.183 → 0.146)
-- Full run: ~69 minutes on consumer CPU
-
-### Previously Completed
-- Identity task mastery (Day 43, 100% solve rate from copy pathway)
-- CHL producing immediate weight corrections on failures
-- Graded per-cell dopamine-modulated reward (2x larger updates on errors)
-- DA-tagged sleep replay (surprising experiences first)
-- Rule-based verification (checks transformation rule, not pixel matching)
-- 156 regression tests across graph, plasticity, kernels, perception, and brain engine
+**Key metrics:**
+- KC patterns stable across retries (Jaccard 0.78–0.94)
+- APL inhibition maintains ~10% L3 sparseness
+- Eval motor loop: deterministic 9-position cycling, matching training
 
 ## Roadmap
 
-### Phase 1: Bee Brain (current)
+### Phase 1: Bee Brain — Trial-and-Error Learning (COMPLETE)
 
-Single-rule pattern learning via mushroom body → MOTOR associations.
+Single-rule pattern learning via mushroom body → MBON depression.
 
-- [x] L1 feature learning — unsupervised local detectors
-- [x] Developmental staging — infancy through late infancy with smooth transitions
-- [x] Mushroom body (L3) — expansion recoding, APL inhibition, sparse pattern separation
-- [x] Gaze system — active visual exploration of stimuli
-- [x] Identity mastery via copy pathway
-- [ ] **Childhood supervised learning** — CHL + eligibility-modulated reward on curriculum tasks
-- [ ] **L3 → MOTOR association learning** — DA-gated KC→MBON plasticity for rule encoding
-- [ ] **Multi-task curriculum** — solid fill, binarize, color swap, flip without catastrophic interference
-- [ ] **Wire GPU acceleration** — CuPy kernels exist, need integration for 2000-neuron network
-- [ ] **Benchmark on ARC-AGI-1 training set**
+- [x] Mushroom body (L3) — expansion recoding, APL inhibition, local receptive fields
+- [x] MBON depression-only learning — suppress wrong colors across retries
+- [x] Attentional spotlight — center-surround gain with L3 reset
+- [x] copy_bias tuning — low enough for depression to override (0.05)
+- [x] Deterministic motor loop — teacher-driven position cycling
+- [x] Multi-task curriculum — identity, solid_fill, color_swap, color_extract
+- [x] Evolutionary parameter search (evolve.py)
 
-### Phase 2: Reasoning Module (planned)
+### Phase 2: Within-Task Generalization (current)
 
-Add mammalian-style working memory for multi-step compositional reasoning on top of L3's sparse pattern codes. This follows the evolutionary sequence — insects evolved mushroom bodies ~500M years ago, mammals later evolved neocortex on top of similar pattern separation machinery.
+Brain sees N instances of a task type, then solves new instances *faster*. MBON weights carry useful information forward between instances.
 
-- [ ] Working memory via MEMORY + GATE regions
-- [ ] Sequential rule application (compose transformations)
-- [ ] Benchmark on full ARC-AGI-1, then ARC-AGI-2
+- [ ] Expand to 4×4 grids (3×3 too few combinations)
+- [ ] Learnable attention pointer (decouple from POSITION winner)
+- [ ] Cross-position relational features
+- [ ] flip_h solvable with learnable attention
+- [ ] Holdout accuracy >> random baseline
+
+### Phase 3: Demo Observation & One-Shot Learning
+
+Brain observes input→output demo pairs and extracts the transformation rule. Analogical reasoning — the core of what ARC-AGI tests.
+
+- [ ] Re-enable demo grid observation
+- [ ] Comparison circuit for input→output differences
+- [ ] Rule extraction via MBON patterns
+- [ ] One-shot test solving from demos alone
 
 ## Why This Approach?
 
@@ -133,7 +139,7 @@ Add mammalian-style working memory for multi-step compositional reasoning on top
 
 ## Hardware
 
-Runs on consumer hardware. The full 40-day developmental lifecycle completes in ~70 minutes on CPU. GPU acceleration (CuPy kernels, written but not yet integrated) will reduce this further.
+Runs on consumer hardware. GPU acceleration via CuPy kernels (written, not yet integrated) will reduce iteration time further.
 
 ## Project Structure
 
